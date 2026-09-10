@@ -282,6 +282,61 @@ def test_draft_allows_no_platform_but_publish_requires_one(client):
     assert publish.json()["code"] == "platform_required"
 
 
+def test_draft_can_reference_uploading_media_but_cannot_publish_it(client):
+    email = "uploading-draft@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=("instagram",)))
+    media = client.post(
+        "/v1/media",
+        json={"filename": "still-uploading.mp4", "mime_type": "video/mp4", "size_bytes": 8},
+        headers=headers,
+    ).json()
+
+    draft = client.post(
+        "/v1/posts",
+        json={"media_id": media["id"], "caption": "Save while uploading", "versions": []},
+        headers=headers,
+    )
+    assert draft.status_code == 201, draft.text
+    assert draft.json()["media"]["status"] == "uploading"
+
+    publish = client.post(
+        f"/v1/posts/{draft.json()['id']}/publish",
+        json={"mode": "now"},
+        headers=headers,
+    )
+    assert publish.status_code == 409
+    assert publish.json()["code"] == "media_not_ready"
+
+
+def test_draft_rejects_failed_media(client):
+    email = "failed-media-draft@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email))
+    media = client.post(
+        "/v1/media",
+        json={"filename": "failed.mp4", "mime_type": "video/mp4", "size_bytes": 8},
+        headers=headers,
+    ).json()
+
+    async def mark_media_failed() -> None:
+        async with SessionLocal() as db:
+            asset = await db.get(MediaAsset, media["id"])
+            asset.status = "failed"
+            await db.commit()
+
+    asyncio.run(mark_media_failed())
+    draft = client.post(
+        "/v1/posts",
+        json={"media_id": media["id"], "caption": "Should fail", "versions": []},
+        headers=headers,
+    )
+    assert draft.status_code == 409
+    assert draft.json()["code"] == "media_failed"
+
+
 def test_retry_submits_only_the_failed_platform(client, monkeypatch):
     email = "platform-retry@example.com"
     auth = register(client, email)

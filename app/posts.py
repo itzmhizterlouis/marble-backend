@@ -176,10 +176,15 @@ async def create_post(
     media = await db.scalar(
         select(MediaAsset).where(MediaAsset.id == payload.media_id, MediaAsset.user_id == user.id)
     )
-    if not media or media.status != "ready":
+    if not media:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "media_not_found", "message": "Upload not found"},
+        )
+    if media.status == "failed":
         raise HTTPException(
             status_code=409,
-            detail={"code": "media_not_ready", "message": "Finish processing the video first"},
+            detail={"code": "media_failed", "message": "This video could not be processed"},
         )
     post = Post(
         user_id=user.id,
@@ -214,13 +219,17 @@ async def update_post(
             select(MediaAsset).where(
                 MediaAsset.id == payload.media_id,
                 MediaAsset.user_id == user.id,
-                MediaAsset.status == "ready",
             )
         )
         if not media:
             raise HTTPException(
+                status_code=404,
+                detail={"code": "media_not_found", "message": "Upload not found"},
+            )
+        if media.status == "failed":
+            raise HTTPException(
                 status_code=409,
-                detail={"code": "media_not_ready", "message": "Finish uploading the video first"},
+                detail={"code": "media_failed", "message": "This video could not be processed"},
             )
         post.media_id = media.id
     post.title, post.caption, post.hashtags = payload.title.strip(), payload.caption.strip(), payload.hashtags
