@@ -31,6 +31,8 @@ SQLite is the zero-setup development default. Use PostgreSQL in staging and prod
 - Frontend: set `FRONTEND_URL` to the exact Vercel origin and `API_PUBLIC_URL` to the Railway origin.
 - R2: set `STORAGE_BACKEND=r2`, `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_REGION=auto`. The R2 token should be limited to Object Read & Write on this bucket only. Configure the private `reverb` bucket CORS for the exact `FRONTEND_URL`, `PUT`, the `Content-Type` request header, and the `ETag` exposed response header so browsers can complete signed parts. `R2_PRESIGN_TTL_SECONDS` controls signed-part expiry and `R2_MULTIPART_PART_SIZE_BYTES` must be at least 5 MiB.
 
+R2 parts upload directly from the browser with bounded concurrency. Completing an upload returns `202` with media status `processing`; FFprobe, checksum generation, and thumbnail creation run in Celery, then emit a `media.updated` realtime event when the asset becomes `ready` or `failed`.
+
 ## Railway
 
 Create one Railway project containing this service, PostgreSQL, and Redis. Keep `STORAGE_ROOT=/data` for temporary FFmpeg/provider materialization and legacy local media. With `STORAGE_BACKEND=r2`, new source videos and thumbnails are stored in the private R2 bucket and the volume is only a processing/compatibility fallback. The container supervises FastAPI, one Celery worker, and Celery beat. Railway should provide `DATABASE_URL` and `REDIS_URL`; convert the database URL to the `postgresql+asyncpg://` scheme if needed.

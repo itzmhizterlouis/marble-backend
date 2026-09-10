@@ -176,9 +176,10 @@ async def create_post(
     media = await db.scalar(
         select(MediaAsset).where(MediaAsset.id == payload.media_id, MediaAsset.user_id == user.id)
     )
-    if not media or media.status == "failed":
+    if not media or media.status != "ready":
         raise HTTPException(
-            status_code=409, detail={"code": "media_unavailable", "message": "Choose a valid video"}
+            status_code=409,
+            detail={"code": "media_not_ready", "message": "Finish processing the video first"},
         )
     post = Post(
         user_id=user.id,
@@ -213,7 +214,7 @@ async def update_post(
             select(MediaAsset).where(
                 MediaAsset.id == payload.media_id,
                 MediaAsset.user_id == user.id,
-                MediaAsset.status != "failed",
+                MediaAsset.status == "ready",
             )
         )
         if not media:

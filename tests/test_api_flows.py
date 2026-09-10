@@ -5,7 +5,7 @@ import json
 import time
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import Text, select, update
 from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
@@ -13,7 +13,7 @@ from app.database import SessionLocal, task_engine
 from app.models import MediaAsset, Post, Publication, SocialConnection, User
 from app.providers import UploadPostClient
 from app.storage import StoredPart
-from app.tasks import _reconcile_active, _retry_platform
+from app.tasks import _process_media, _reconcile_active, _retry_platform
 
 
 def register(client, email: str) -> dict:
@@ -139,7 +139,7 @@ def test_r2_multipart_parts_are_signed_and_confirmed(client, monkeypatch):
             return f"users/{user_id}/media/{media_id}/source{suffix}"
 
         async def create_multipart_upload(self, _key, _content_type):
-            return "fake-upload-id"
+            return "r2-" + "x" * 400
 
         async def presign_part(self, _key, _upload_id, _part_number):
             return "https://r2.example/signed-part"
@@ -156,6 +156,7 @@ def test_r2_multipart_parts_are_signed_and_confirmed(client, monkeypatch):
     assert initialized.status_code == 201, initialized.text
     assert initialized.json()["upload_mode"] == "r2"
     assert initialized.json()["uploaded_bytes"] == 0
+    assert isinstance(MediaAsset.__table__.c.multipart_upload_id.type, Text)
     media_id = initialized.json()["id"]
 
     signed = client.post(f"/v1/media/{media_id}/parts/1/sign", headers=headers)
@@ -217,14 +218,17 @@ def test_r2_media_completion_processes_source_and_thumbnail(client, monkeypatch)
             return FakeR2Storage.thumbnail_bytes
 
     monkeypatch.setattr("app.media_routes.R2Storage", FakeR2Storage)
-    monkeypatch.setattr("app.media_routes.sha256_file", lambda _path: "a" * 64)
-    monkeypatch.setattr("app.media_routes.probe_video", lambda _path: (12, 1080, 1920))
+    monkeypatch.setattr("app.tasks.R2Storage", FakeR2Storage)
+    monkeypatch.setattr("app.storage.R2Storage", FakeR2Storage)
+    monkeypatch.setattr("app.tasks.sha256_file", lambda _path: "a" * 64)
+    monkeypatch.setattr("app.tasks.probe_video", lambda _path: (12, 1080, 1920))
+    monkeypatch.setattr("app.tasks.process_media.delay", lambda _media_id: None)
 
     def fake_thumbnail(_source, destination):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(b"fake-jpeg")
 
-    monkeypatch.setattr("app.media_routes.create_thumbnail", fake_thumbnail)
+    monkeypatch.setattr("app.tasks.create_thumbnail", fake_thumbnail)
     initialized = client.post(
         "/v1/media",
         json={"filename": "clip.mp4", "mime_type": "video/mp4", "size_bytes": 8},
@@ -238,10 +242,15 @@ def test_r2_media_completion_processes_source_and_thumbnail(client, monkeypatch)
     )
 
     completed = client.post(f"/v1/media/{media_id}/complete", headers=headers)
-    assert completed.status_code == 200, completed.text
-    assert completed.json()["status"] == "ready"
-    assert completed.json()["thumbnail_url"]
+    assert completed.status_code == 202, completed.text
+    assert completed.json()["status"] == "processing"
     assert FakeR2Storage.completed is True
+
+    asyncio.run(_process_media(media_id))
+    ready = client.get(f"/v1/media/{media_id}", headers=headers)
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+    assert ready.json()["thumbnail_url"]
     assert FakeR2Storage.thumbnail_bytes == b"fake-jpeg"
     assert FakeR2Storage.processing_path is not None
     assert not FakeR2Storage.processing_path.parent.exists()

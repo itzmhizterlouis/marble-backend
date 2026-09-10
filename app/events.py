@@ -30,8 +30,8 @@ def user_channel(user_id: str) -> str:
     return f"marble:user:{user_id}:events"
 
 
-async def publish_post_event(user_id: str, post_id: str, event_type: str = "post.updated") -> None:
-    """Publish best-effort cache invalidation after durable state has committed."""
+async def publish_realtime_event(user_id: str, event_type: str, **identifiers: str) -> None:
+    """Publish a best-effort state notification after durable state has committed."""
     settings = get_settings()
     if settings.environment.lower() == "test":
         return
@@ -45,16 +45,24 @@ async def publish_post_event(user_id: str, post_id: str, event_type: str = "post
         {
             "id": str(uuid.uuid4()),
             "type": event_type,
-            "post_id": post_id,
+            **identifiers,
             "occurred_at": datetime.now(UTC).isoformat(),
         }
     )
     try:
         await redis.publish(user_channel(user_id), payload)
     except RedisError:
-        logger.warning("Could not publish realtime event for post %s", post_id, exc_info=True)
+        logger.warning("Could not publish realtime event %s", event_type, exc_info=True)
     finally:
         await redis.aclose()
+
+
+async def publish_post_event(user_id: str, post_id: str, event_type: str = "post.updated") -> None:
+    await publish_realtime_event(user_id, event_type, post_id=post_id)
+
+
+async def publish_media_event(user_id: str, media_id: str) -> None:
+    await publish_realtime_event(user_id, "media.updated", media_id=media_id)
 
 
 async def authenticated_user_id(credentials: HTTPAuthorizationCredentials | None) -> str:

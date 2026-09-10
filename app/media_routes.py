@@ -3,22 +3,23 @@ import hashlib
 import hmac
 import logging
 import math
-import shutil
-import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jwt
+from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import ClientDisconnect
 
 from .config import get_settings
 from .database import get_db
 from .deps import get_current_user, require_verified_user
-from .media import append_chunk, create_thumbnail, parse_content_range, probe_video, sha256_file
+from .events import publish_media_event
+from .media import append_chunk, parse_content_range
 from .models import MediaAsset, MediaUploadPart, Post, User
 from .schemas import MediaInitIn, MediaOut, MediaPartConfirmIn, MediaPartUrlOut, MessageOut
 from .security import create_media_token, decode_media_token
@@ -49,7 +50,11 @@ async def read_upload_chunk(request: Request, maximum_bytes: int) -> bytes:
     return b"".join(parts)
 
 
-def media_out(asset: MediaAsset, include_chunk_size: bool = False) -> MediaOut:
+def media_out(
+    asset: MediaAsset,
+    include_chunk_size: bool = False,
+    uploaded_parts: list[int] | None = None,
+) -> MediaOut:
     settings = get_settings()
     thumbnail_url = None
     if asset.thumbnail_path or asset.thumbnail_key:
@@ -74,6 +79,7 @@ def media_out(asset: MediaAsset, include_chunk_size: bool = False) -> MediaOut:
         if include_chunk_size
         else None,
         upload_mode=asset.storage_backend,
+        uploaded_parts=uploaded_parts or [],
     )
 
 
@@ -110,37 +116,86 @@ async def initialize_media(
         size_bytes=payload.size_bytes,
         storage_path="pending",
         storage_backend=settings.storage_backend,
+        status="initializing",
         delete_after=datetime.now(UTC) + timedelta(hours=24),
     )
     db.add(asset)
-    await db.flush()
+    try:
+        # Persist an initialization record before making an external R2 write.
+        # A stale record can be reconciled; an untracked multipart upload cannot.
+        await db.commit()
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "upload_initialization_failed",
+                "message": "The upload could not be started. Please try again",
+            },
+        ) from exc
     asset_id = asset.id
+    if settings.storage_backend != "r2":
+        asset.storage_path = str(settings.storage_root / "uploads" / f"{asset.id}{suffix}")
+        asset.status = "uploading"
+        try:
+            await db.commit()
+        except SQLAlchemyError as exc:
+            await db.rollback()
+            try:
+                failed_asset = await db.get(MediaAsset, asset_id)
+                if failed_asset:
+                    failed_asset.status = "failed"
+                    failed_asset.delete_after = datetime.now(UTC) + timedelta(hours=24)
+                    await db.commit()
+            except SQLAlchemyError:
+                await db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "upload_initialization_failed",
+                    "message": "The upload could not be started. Please try again",
+                },
+            ) from exc
+        return media_out(asset, include_chunk_size=True)
+
     r2_storage: R2Storage | None = None
     r2_upload_id: str | None = None
     r2_object_key: str | None = None
     try:
-        if settings.storage_backend == "r2":
-            r2_storage = R2Storage(settings)
-            asset.object_key = r2_storage.object_key(user.id, asset.id, suffix)
-            r2_object_key = asset.object_key
-            r2_upload_id = await r2_storage.create_multipart_upload(
-                asset.object_key, payload.mime_type
-            )
-            asset.multipart_upload_id = r2_upload_id
-            asset.storage_path = ""
-        else:
-            asset.storage_path = str(settings.storage_root / "uploads" / f"{asset.id}{suffix}")
+        r2_storage = R2Storage(settings)
+        asset.object_key = r2_storage.object_key(user.id, asset.id, suffix)
+        r2_object_key = asset.object_key
+        r2_upload_id = await r2_storage.create_multipart_upload(
+            asset.object_key, payload.mime_type
+        )
+        asset.multipart_upload_id = r2_upload_id
+        asset.storage_path = ""
+        asset.status = "uploading"
         await db.commit()
-    except StorageError as exc:
+    except (StorageError, SQLAlchemyError) as exc:
         await db.rollback()
         if r2_storage and r2_upload_id and r2_object_key:
             try:
                 await r2_storage.abort_multipart_upload(r2_object_key, r2_upload_id)
             except StorageError:
                 logger.warning("Could not abort failed R2 upload initialization for media %s", asset_id)
+        try:
+            failed_asset = await db.get(MediaAsset, asset_id)
+            if failed_asset:
+                failed_asset.status = "failed"
+                failed_asset.object_key = None
+                failed_asset.multipart_upload_id = None
+                failed_asset.delete_after = datetime.now(UTC) + timedelta(hours=24)
+                await db.commit()
+        except SQLAlchemyError:
+            await db.rollback()
+            logger.warning("Could not persist failed upload initialization for media %s", asset_id)
         raise HTTPException(
             status_code=503,
-            detail={"code": "storage_unavailable", "message": "Media storage is temporarily unavailable"},
+            detail={
+                "code": "upload_initialization_failed",
+                "message": "The upload could not be started. Please try again",
+            },
         ) from exc
     return media_out(asset, include_chunk_size=True)
 
@@ -149,7 +204,19 @@ async def initialize_media(
 async def get_media(
     media_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
-    return media_out(await owned_media(db, user, media_id), include_chunk_size=True)
+    asset = await owned_media(db, user, media_id)
+    uploaded_parts = (
+        list(
+            await db.scalars(
+                select(MediaUploadPart.part_number)
+                .where(MediaUploadPart.media_id == asset.id)
+                .order_by(MediaUploadPart.part_number)
+            )
+        )
+        if asset.storage_backend == "r2"
+        else []
+    )
+    return media_out(asset, include_chunk_size=True, uploaded_parts=uploaded_parts)
 
 
 def r2_part_count(asset: MediaAsset, settings) -> int:
@@ -305,20 +372,6 @@ async def confirm_upload_part(
             status_code=422,
             detail={"code": "invalid_part_size", "message": "The uploaded part has an invalid size"},
         )
-    try:
-        remote_parts = await R2Storage(settings).list_parts(asset.object_key, asset.multipart_upload_id)
-    except StorageError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={"code": "storage_unavailable", "message": "Media storage is temporarily unavailable"},
-        ) from exc
-    remote = next((part for part in remote_parts if part.part_number == part_number), None)
-    if not remote or normalize_etag(remote.etag) != normalize_etag(payload.etag) or remote.size_bytes != payload.size_bytes:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "part_confirmation_failed", "message": "R2 did not confirm this upload part"},
-        )
-
     asset = await owned_media(db, user, media_id, lock=True)
     if asset.storage_backend != "r2" or asset.status != "uploading":
         raise HTTPException(
@@ -351,17 +404,14 @@ async def confirm_upload_part(
             .order_by(MediaUploadPart.part_number)
         )
     )
-    uploaded_bytes = 0
-    for expected_number, item in enumerate(records, start=1):
-        if item.part_number != expected_number:
-            break
-        if item.size_bytes != r2_expected_part_size(asset, item.part_number, settings):
-            break
-        uploaded_bytes += item.size_bytes
-    asset.uploaded_bytes = uploaded_bytes
+    asset.uploaded_bytes = sum(item.size_bytes for item in records)
     asset.delete_after = datetime.now(UTC) + timedelta(hours=24)
     await db.commit()
-    return media_out(asset, include_chunk_size=True)
+    return media_out(
+        asset,
+        include_chunk_size=True,
+        uploaded_parts=[item.part_number for item in records],
+    )
 
 
 @router.put("/{media_id}", response_model=MediaOut)
@@ -439,30 +489,32 @@ async def upload_chunk(
     return media_out(asset, include_chunk_size=True)
 
 
-@router.post("/{media_id}/complete", response_model=MediaOut)
+@router.post("/{media_id}/complete", response_model=MediaOut, status_code=202)
 async def complete_media(
     media_id: str, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
     asset = await owned_media(db, user, media_id, lock=True)
-    if asset.status == "ready":
+    if asset.status in {"ready", "processing"}:
         return media_out(asset)
+    if asset.status in {"failed", "expired", "initializing"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "upload_not_active", "message": "This upload cannot be completed"},
+        )
     if asset.uploaded_bytes != asset.size_bytes:
         raise HTTPException(
             status_code=409, detail={"code": "upload_incomplete", "message": "Upload is not complete"}
         )
-    if asset.storage_backend == "r2":
+    if asset.storage_backend == "r2" and asset.status != "uploaded":
         if not asset.object_key:
             raise HTTPException(
                 status_code=409,
                 detail={"code": "upload_not_active", "message": "The uploaded object is missing"},
             )
         settings = get_settings()
+        parts = await stored_r2_parts(db, asset)
+        storage = R2Storage(settings)
         try:
-            parts = await stored_r2_parts(db, asset)
-        except HTTPException:
-            raise
-        try:
-            storage = R2Storage(settings)
             if asset.multipart_upload_id:
                 remote_parts = await storage.list_parts(asset.object_key, asset.multipart_upload_id)
                 remote_by_number = {part.part_number: part for part in remote_parts}
@@ -478,70 +530,52 @@ async def complete_media(
                         },
                     )
                 await storage.complete_multipart_upload(asset.object_key, asset.multipart_upload_id, parts)
-                asset.multipart_upload_id = None
-                await db.commit()
         except StorageError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "storage_unavailable", "message": "Media storage is temporarily unavailable"},
-            ) from exc
+            # R2 may have completed the external operation before the previous
+            # request lost its database commit. Recover by verifying the final
+            # object rather than trying to complete the dead upload ID forever.
+            try:
+                completed_size = await storage.object_size(asset.object_key)
+            except StorageError:
+                completed_size = None
+            if completed_size != asset.size_bytes:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "storage_unavailable",
+                        "message": "Media storage is temporarily unavailable",
+                    },
+                ) from exc
+        asset.multipart_upload_id = None
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="reverb-media-processing-", dir=settings.storage_root))
-        path = temp_dir / f"{asset.id}{'.mov' if asset.mime_type == 'video/quicktime' else '.mp4'}"
-        thumbnail = temp_dir / f"{asset.id}.jpg"
-        thumbnail_key = asset.thumbnail_key or storage.thumbnail_key(asset.user_id, asset.id)
-        try:
-            await storage.download_to_path(asset.object_key, path)
-            checksum = await asyncio.to_thread(sha256_file, path)
-            duration, width, height = await asyncio.to_thread(probe_video, path)
-            if duration < 1 or duration > 600:
-                raise ValueError("Videos must be between 1 second and 10 minutes")
-            await asyncio.to_thread(create_thumbnail, path, thumbnail)
-            await storage.put_file(thumbnail, thumbnail_key, "image/jpeg")
-        except StorageError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "storage_unavailable", "message": "Media storage is temporarily unavailable"},
-            ) from exc
-        except (RuntimeError, ValueError, KeyError, OSError) as exc:
-            asset.status = "failed"
-            asset.delete_after = datetime.now(UTC) + timedelta(days=7)
-            await db.commit()
-            raise HTTPException(status_code=422, detail={"code": "invalid_video", "message": str(exc)}) from exc
-        finally:
-            # The temporary directory is removed explicitly because the source
-            # video may be hundreds of megabytes and must not remain on /data.
-            await asyncio.to_thread(shutil.rmtree, temp_dir, True)
-        asset.checksum_sha256 = checksum
-        asset.duration_seconds = duration
-        asset.width = width
-        asset.height = height
-        asset.thumbnail_key = thumbnail_key
-        asset.status = "ready"
-        asset.delete_after = datetime.now(UTC) + timedelta(days=7)
-        await db.commit()
-        return media_out(asset)
-
-    path = Path(asset.storage_path)
+    asset.status = "processing"
     try:
-        checksum = await asyncio.to_thread(sha256_file, path)
-        duration, width, height = await asyncio.to_thread(probe_video, path)
-        if duration < 1 or duration > 600:
-            raise ValueError("Videos must be between 1 second and 10 minutes")
-        thumbnail = get_settings().storage_root / "thumbnails" / f"{asset.id}.jpg"
-        await asyncio.to_thread(create_thumbnail, path, thumbnail)
-    except (RuntimeError, ValueError, KeyError, OSError) as exc:
-        asset.status = "failed"
         await db.commit()
-        raise HTTPException(status_code=422, detail={"code": "invalid_video", "message": str(exc)}) from exc
-    asset.checksum_sha256 = checksum
-    asset.duration_seconds = duration
-    asset.width = width
-    asset.height = height
-    asset.thumbnail_path = str(thumbnail)
-    asset.status = "ready"
-    asset.delete_after = datetime.now(UTC) + timedelta(days=7)
-    await db.commit()
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "upload_completion_failed",
+                "message": "The upload was saved but processing could not start. Please retry",
+            },
+        ) from exc
+    try:
+        from .tasks import process_media
+
+        process_media.delay(asset.id)
+    except CeleryError as exc:
+        asset = await owned_media(db, user, media_id, lock=True)
+        asset.status = "uploaded"
+        await db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "processing_unavailable",
+                "message": "The video was uploaded, but processing could not start. Please retry",
+            },
+        ) from exc
+    await publish_media_event(user.id, asset.id)
     return media_out(asset)
 
 

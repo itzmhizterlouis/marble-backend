@@ -13,7 +13,8 @@ from sqlalchemy.orm import selectinload
 
 from .config import get_settings
 from .database import TaskSessionLocal
-from .events import publish_post_event
+from .events import publish_media_event, publish_post_event
+from .media import create_thumbnail, probe_video, sha256_file
 from .models import MediaAsset, Post, Publication, PublicationAttempt, User, utcnow
 from .notifications import deliver_pending_notifications, queue_terminal_notification
 from .providers import (
@@ -43,6 +44,95 @@ celery_app.conf.update(
         },
     },
 )
+
+
+async def _process_media(media_id: str) -> None:
+    async with TaskSessionLocal() as db:
+        asset = await db.get(MediaAsset, media_id)
+        if not asset or asset.status not in {"processing", "uploaded"}:
+            return
+        asset.status = "processing"
+        await db.commit()
+
+        try:
+            if asset.storage_backend == "r2":
+                if not asset.object_key:
+                    raise ValueError("The uploaded video is no longer available")
+                storage = R2Storage(settings)
+                async with materialize_object(
+                    storage_backend=asset.storage_backend,
+                    object_key=asset.object_key,
+                    storage_path=asset.storage_path,
+                    filename=asset.original_name,
+                ) as video_path:
+                    thumbnail = video_path.parent / f"{asset.id}.jpg"
+                    checksum = await asyncio.to_thread(sha256_file, video_path)
+                    duration, width, height = await asyncio.to_thread(probe_video, video_path)
+                    if duration < 1 or duration > 600:
+                        raise ValueError("Videos must be between 1 second and 10 minutes")
+                    await asyncio.to_thread(create_thumbnail, video_path, thumbnail)
+                    thumbnail_key = asset.thumbnail_key or storage.thumbnail_key(asset.user_id, asset.id)
+                    await storage.put_file(thumbnail, thumbnail_key, "image/jpeg")
+            else:
+                video_path = Path(asset.storage_path)
+                checksum = await asyncio.to_thread(sha256_file, video_path)
+                duration, width, height = await asyncio.to_thread(probe_video, video_path)
+                if duration < 1 or duration > 600:
+                    raise ValueError("Videos must be between 1 second and 10 minutes")
+                thumbnail = settings.storage_root / "thumbnails" / f"{asset.id}.jpg"
+                await asyncio.to_thread(create_thumbnail, video_path, thumbnail)
+                thumbnail_key = None
+        except StorageError:
+            # Preserve the processing state so Celery can safely retry the same
+            # idempotent validation job.
+            raise
+        except (RuntimeError, ValueError, KeyError, OSError) as exc:
+            current = await db.get(MediaAsset, media_id)
+            if current:
+                current.status = "failed"
+                current.delete_after = datetime.now(UTC) + timedelta(days=7)
+                await db.commit()
+                await publish_media_event(current.user_id, current.id)
+            logger.info("Media validation failed for %s: %s", media_id, exc)
+            return
+
+        current = await db.get(MediaAsset, media_id)
+        if not current or current.status not in {"processing", "uploaded"}:
+            return
+        current.checksum_sha256 = checksum
+        current.duration_seconds = duration
+        current.width = width
+        current.height = height
+        if current.storage_backend == "r2":
+            current.thumbnail_key = thumbnail_key
+        else:
+            current.thumbnail_path = str(thumbnail)
+        current.status = "ready"
+        current.delete_after = datetime.now(UTC) + timedelta(days=7)
+        await db.commit()
+        await publish_media_event(current.user_id, current.id)
+
+
+async def _fail_media_processing(media_id: str) -> None:
+    async with TaskSessionLocal() as db:
+        asset = await db.get(MediaAsset, media_id)
+        if not asset or asset.status != "processing":
+            return
+        asset.status = "failed"
+        asset.delete_after = datetime.now(UTC) + timedelta(days=7)
+        await db.commit()
+        await publish_media_event(asset.user_id, asset.id)
+
+
+@celery_app.task(bind=True, name="marble.process_media", max_retries=3)
+def process_media(task, media_id: str) -> None:
+    try:
+        asyncio.run(_process_media(media_id))
+    except (StorageError, OperationalError) as exc:
+        if task.request.retries >= task.max_retries:
+            asyncio.run(_fail_media_processing(media_id))
+            return
+        raise task.retry(exc=exc, countdown=2 ** task.request.retries) from exc
 
 
 def derive_post_status(post: Post) -> str:
@@ -549,6 +639,14 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                 "action_required",
             }:
                 publication.status = "queued"
+        except StorageError as exc:
+            publication.status = "queued"
+            publication.error_code = "storage_unavailable"
+            publication.error_message = "The video could not be retrieved for retry"
+            post.status = derive_post_status(post)
+            await db.commit()
+            await publish_post_event(post.user_id, post.id)
+            raise exc
         except ProviderError as exc:
             publication.status = "failed"
             publication.error_code = exc.code
@@ -568,14 +666,37 @@ async def _retry_platform(post_id: str, platform: str) -> None:
         await publish_post_event(post.user_id, post.id)
 
 
-@celery_app.task(
-    name="marble.retry_platform",
-    autoretry_for=(OSError, OperationalError),
-    retry_backoff=True,
-    max_retries=3,
-)
-def retry_platform(post_id: str, platform: str) -> None:
-    asyncio.run(_retry_platform(post_id, platform))
+async def _fail_platform_retry(post_id: str, platform: str) -> None:
+    async with TaskSessionLocal() as db:
+        post = await db.scalar(
+            select(Post)
+            .where(Post.id == post_id)
+            .options(selectinload(Post.publications), selectinload(Post.media))
+        )
+        if not post:
+            return
+        publication = next((item for item in post.publications if item.platform == platform), None)
+        if not publication or publication.status != "queued":
+            return
+        publication.status = "failed"
+        publication.error_code = "storage_unavailable"
+        publication.error_message = "Reverb could not retrieve the video after several attempts"
+        post.status = derive_post_status(post)
+        post.media.delete_after = utcnow() + timedelta(days=7)
+        await queue_terminal_notification(db, post)
+        await db.commit()
+        await publish_post_event(post.user_id, post.id)
+
+
+@celery_app.task(bind=True, name="marble.retry_platform", max_retries=3)
+def retry_platform(task, post_id: str, platform: str) -> None:
+    try:
+        asyncio.run(_retry_platform(post_id, platform))
+    except (StorageError, OperationalError) as exc:
+        if task.request.retries >= task.max_retries:
+            asyncio.run(_fail_platform_retry(post_id, platform))
+            return
+        raise task.retry(exc=exc, countdown=2 ** task.request.retries) from exc
 
 
 async def _reconcile_active() -> None:
@@ -658,26 +779,27 @@ async def _cleanup_media() -> None:
             )
         )
         for asset in assets:
+            post_count = await db.scalar(select(func.count(Post.id)).where(Post.media_id == asset.id))
             try:
                 if asset.storage_backend == "r2":
                     storage = R2Storage()
                     if asset.multipart_upload_id and asset.object_key:
                         await storage.abort_multipart_upload(asset.object_key, asset.multipart_upload_id)
                     await storage.delete_object(asset.object_key)
-                    await storage.delete_object(asset.thumbnail_key)
+                    if not post_count:
+                        await storage.delete_object(asset.thumbnail_key)
                 elif asset.storage_path:
                     Path(asset.storage_path).unlink(missing_ok=True)
             except StorageError:
                 logger.exception("Could not clean up media asset %s", asset.id)
                 continue
-            post_count = await db.scalar(select(func.count(Post.id)).where(Post.media_id == asset.id))
             if post_count:
                 if asset.storage_backend == "r2":
                     asset.object_key = ""
-                    asset.thumbnail_key = None
                     asset.multipart_upload_id = None
                 else:
                     asset.storage_path = ""
+                asset.status = "expired"
                 asset.delete_after = None
             else:
                 if asset.storage_backend != "r2" and asset.thumbnail_path:

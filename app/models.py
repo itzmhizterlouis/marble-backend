@@ -115,7 +115,9 @@ class MediaAsset(Base, TimestampMixin):
     storage_backend: Mapped[str] = mapped_column(String(16), default="local", index=True)
     object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     thumbnail_key: Mapped[str | None] = mapped_column(Text, nullable=True)
-    multipart_upload_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # R2 multipart identifiers are opaque and can exceed the common 255-byte
+    # varchar limit. Never impose a provider-specific length on this value.
+    multipart_upload_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)

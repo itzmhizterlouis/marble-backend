@@ -127,6 +127,7 @@ class MediaOut(BaseModel):
     thumbnail_url: str | None = None
     chunk_size: int | None = None
     upload_mode: Literal["local", "r2"] = "local"
+    uploaded_parts: list[int] = Field(default_factory=list)
 
 
 class VersionIn(BaseModel):

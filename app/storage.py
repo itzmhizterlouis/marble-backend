@@ -148,6 +148,24 @@ class R2Storage:
             },
         )
 
+    async def object_size(self, key: str) -> int | None:
+        """Return the completed object size, or None when it does not exist."""
+
+        def head() -> int | None:
+            try:
+                response = self.client.head_object(Bucket=self.bucket, Key=key)
+                return int(response["ContentLength"])
+            except ClientError as exc:
+                status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+                code = str(exc.response.get("Error", {}).get("Code", ""))
+                if status == 404 or code in {"404", "NoSuchKey", "NotFound"}:
+                    return None
+                raise StorageError() from exc
+            except (BotoCoreError, OSError, ValueError, KeyError) as exc:
+                raise StorageError() from exc
+
+        return await asyncio.to_thread(head)
+
     async def abort_multipart_upload(self, key: str, upload_id: str) -> None:
         await self._call(
             "abort_multipart_upload",
