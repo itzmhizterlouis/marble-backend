@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,7 +26,15 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/v1/auth/google/callback"
+    storage_backend: Literal["local", "r2"] = "local"
     storage_root: Path = Path("./data")
+    r2_endpoint: str = ""
+    r2_bucket_name: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_region: str = "auto"
+    r2_presign_ttl_seconds: int = 900
+    r2_multipart_part_size_bytes: int = 8 * 1024 * 1024
     max_upload_bytes: int = 500 * 1024 * 1024
     upload_chunk_bytes: int = 2 * 1024 * 1024
     access_token_minutes: int = 15
@@ -45,8 +54,17 @@ class Settings(BaseSettings):
             return value.replace("postgresql://", "postgresql+asyncpg://", 1)
         return value
 
+    @field_validator("r2_endpoint", mode="before")
+    @classmethod
+    def strip_r2_endpoint_slash(cls, value: str) -> str:
+        return (value or "").rstrip("/")
+
     @model_validator(mode="after")
     def validate_production_configuration(self):
+        if self.r2_multipart_part_size_bytes < 5 * 1024 * 1024:
+            raise ValueError("R2_MULTIPART_PART_SIZE_BYTES must be at least 5 MiB")
+        if not 1 <= self.r2_presign_ttl_seconds <= 604800:
+            raise ValueError("R2_PRESIGN_TTL_SECONDS must be between 1 second and 7 days")
         if not self.is_production:
             return self
         required = {
@@ -64,6 +82,16 @@ class Settings(BaseSettings):
             raise ValueError("JWT_SECRET must be a production secret of at least 32 characters")
         if not self.database_url.startswith("postgresql+asyncpg://"):
             raise ValueError("Production DATABASE_URL must point to PostgreSQL")
+        if self.storage_backend == "r2":
+            r2_required = {
+                "R2_ENDPOINT": self.r2_endpoint,
+                "R2_BUCKET_NAME": self.r2_bucket_name,
+                "R2_ACCESS_KEY_ID": self.r2_access_key_id,
+                "R2_SECRET_ACCESS_KEY": self.r2_secret_access_key,
+            }
+            missing_r2 = [name for name, value in r2_required.items() if not value]
+            if missing_r2:
+                raise ValueError(f"Missing production settings: {', '.join(missing_r2)}")
         return self
 
     @property

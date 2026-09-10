@@ -22,6 +22,7 @@ from .providers import (
     upload_idempotency_key,
     upload_request_id,
 )
+from .storage import R2Storage, StorageError, materialize_object
 
 settings = get_settings()
 UNCLAIMED_QUEUE_TIMEOUT = timedelta(minutes=1)
@@ -237,25 +238,31 @@ async def _publish_post(post_id: str) -> None:
         expected_request_id = upload_request_id(post.id, post.schedule_revision)
         idempotency_key = upload_idempotency_key(post.id, post.schedule_revision)
         try:
-            response = await UploadPostClient().publish_video(
-                profile=post.user.upload_post_profile,
-                video_path=Path(post.media.storage_path),
-                post_id=post.id,
-                revision=post.schedule_revision,
-                versions=[
-                    {
-                        "platform": item.platform,
-                        "caption": item.caption,
-                        "title": item.title,
-                        "options": item.options,
-                    }
-                    for item in post.versions
-                ],
-                scheduled_at=post.scheduled_at_utc.isoformat() if post.scheduled_at_utc else None,
-                timezone=post.schedule_timezone,
-                facebook_page_id=facebook_page_id,
-                request_id=expected_request_id,
-            )
+            async with materialize_object(
+                storage_backend=post.media.storage_backend,
+                object_key=post.media.object_key,
+                storage_path=post.media.storage_path,
+                filename=post.media.original_name,
+            ) as video_path:
+                response = await UploadPostClient().publish_video(
+                    profile=post.user.upload_post_profile,
+                    video_path=video_path,
+                    post_id=post.id,
+                    revision=post.schedule_revision,
+                    versions=[
+                        {
+                            "platform": item.platform,
+                            "caption": item.caption,
+                            "title": item.title,
+                            "options": item.options,
+                        }
+                        for item in post.versions
+                    ],
+                    scheduled_at=post.scheduled_at_utc.isoformat() if post.scheduled_at_utc else None,
+                    timezone=post.schedule_timezone,
+                    facebook_page_id=facebook_page_id,
+                    request_id=expected_request_id,
+                )
             post.provider_request_id = response.get("request_id") or expected_request_id
             post.provider_job_id = response.get("job_id")
             if post.publish_mode == "scheduled" and not post.provider_job_id:
@@ -500,24 +507,30 @@ async def _retry_platform(post_id: str, platform: str) -> None:
             (item.target_page_id for item in post.user.connections if item.platform == "facebook"), None
         )
         try:
-            payload = await client.publish_video(
-                profile=post.user.upload_post_profile,
-                video_path=Path(post.media.storage_path),
-                post_id=retry_post_id,
-                revision=post.schedule_revision,
-                versions=[
-                    {
-                        "platform": version.platform,
-                        "caption": version.caption,
-                        "title": version.title,
-                        "options": version.options,
-                    }
-                ],
-                scheduled_at=None,
-                timezone=None,
-                facebook_page_id=facebook_page_id,
-                request_id=expected_request_id,
-            )
+            async with materialize_object(
+                storage_backend=post.media.storage_backend,
+                object_key=post.media.object_key,
+                storage_path=post.media.storage_path,
+                filename=post.media.original_name,
+            ) as video_path:
+                payload = await client.publish_video(
+                    profile=post.user.upload_post_profile,
+                    video_path=video_path,
+                    post_id=retry_post_id,
+                    revision=post.schedule_revision,
+                    versions=[
+                        {
+                            "platform": version.platform,
+                            "caption": version.caption,
+                            "title": version.title,
+                            "options": version.options,
+                        }
+                    ],
+                    scheduled_at=None,
+                    timezone=None,
+                    facebook_page_id=facebook_page_id,
+                    request_id=expected_request_id,
+                )
             publication.provider_request_id = payload.get("request_id") or expected_request_id
             mark_connections_used(post, {platform})
             await record_provider_attempt(
@@ -645,13 +658,29 @@ async def _cleanup_media() -> None:
             )
         )
         for asset in assets:
-            Path(asset.storage_path).unlink(missing_ok=True)
+            try:
+                if asset.storage_backend == "r2":
+                    storage = R2Storage()
+                    if asset.multipart_upload_id and asset.object_key:
+                        await storage.abort_multipart_upload(asset.object_key, asset.multipart_upload_id)
+                    await storage.delete_object(asset.object_key)
+                    await storage.delete_object(asset.thumbnail_key)
+                elif asset.storage_path:
+                    Path(asset.storage_path).unlink(missing_ok=True)
+            except StorageError:
+                logger.exception("Could not clean up media asset %s", asset.id)
+                continue
             post_count = await db.scalar(select(func.count(Post.id)).where(Post.media_id == asset.id))
             if post_count:
-                asset.storage_path = ""
+                if asset.storage_backend == "r2":
+                    asset.object_key = ""
+                    asset.thumbnail_key = None
+                    asset.multipart_upload_id = None
+                else:
+                    asset.storage_path = ""
                 asset.delete_after = None
             else:
-                if asset.thumbnail_path:
+                if asset.storage_backend != "r2" and asset.thumbnail_path:
                     Path(asset.thumbnail_path).unlink(missing_ok=True)
                 await db.delete(asset)
         await db.commit()

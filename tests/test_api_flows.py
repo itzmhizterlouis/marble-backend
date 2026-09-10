@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.database import SessionLocal, task_engine
 from app.models import MediaAsset, Post, Publication, SocialConnection, User
 from app.providers import UploadPostClient
+from app.storage import StoredPart
 from app.tasks import _reconcile_active, _retry_platform
 
 
@@ -119,6 +120,131 @@ def test_resumable_chunk_checksum_and_offset(client):
     duplicate = client.put(f"/v1/media/{media_id}", content=chunk, headers=upload_headers)
     assert duplicate.status_code == 409
     assert duplicate.json()["code"] == "invalid_upload_offset"
+
+
+def test_r2_multipart_parts_are_signed_and_confirmed(client, monkeypatch):
+    email = "r2-upload@example.com"
+    auth = register(client, email)
+    asyncio.run(verify_and_connect(email))
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    settings = get_settings()
+    monkeypatch.setattr(settings, "storage_backend", "r2")
+
+    class FakeR2Storage:
+        def __init__(self, _settings=None):
+            pass
+
+        @staticmethod
+        def object_key(user_id, media_id, suffix):
+            return f"users/{user_id}/media/{media_id}/source{suffix}"
+
+        async def create_multipart_upload(self, _key, _content_type):
+            return "fake-upload-id"
+
+        async def presign_part(self, _key, _upload_id, _part_number):
+            return "https://r2.example/signed-part"
+
+        async def list_parts(self, _key, _upload_id):
+            return [StoredPart(part_number=1, etag="fake-etag", size_bytes=8)]
+
+    monkeypatch.setattr("app.media_routes.R2Storage", FakeR2Storage)
+    initialized = client.post(
+        "/v1/media",
+        json={"filename": "clip.mp4", "mime_type": "video/mp4", "size_bytes": 8},
+        headers=headers,
+    )
+    assert initialized.status_code == 201, initialized.text
+    assert initialized.json()["upload_mode"] == "r2"
+    assert initialized.json()["uploaded_bytes"] == 0
+    media_id = initialized.json()["id"]
+
+    signed = client.post(f"/v1/media/{media_id}/parts/1/sign", headers=headers)
+    assert signed.status_code == 200, signed.text
+    assert signed.json()["part_number"] == 1
+    assert signed.json()["url"] == "https://r2.example/signed-part"
+
+    confirmed = client.post(
+        f"/v1/media/{media_id}/parts/1/confirm",
+        json={"part_number": 1, "etag": '"fake-etag"', "size_bytes": 8},
+        headers=headers,
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["uploaded_bytes"] == 8
+    assert confirmed.json()["chunk_size"] == settings.r2_multipart_part_size_bytes
+
+
+def test_r2_media_completion_processes_source_and_thumbnail(client, monkeypatch):
+    email = "r2-complete@example.com"
+    auth = register(client, email)
+    asyncio.run(verify_and_connect(email))
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    settings = get_settings()
+    monkeypatch.setattr(settings, "storage_backend", "r2")
+
+    class FakeR2Storage:
+        completed = False
+        thumbnail_bytes = b""
+        processing_path = None
+
+        def __init__(self, _settings=None):
+            pass
+
+        @staticmethod
+        def object_key(user_id, media_id, suffix):
+            return f"users/{user_id}/media/{media_id}/source{suffix}"
+
+        @staticmethod
+        def thumbnail_key(user_id, media_id):
+            return f"users/{user_id}/media/{media_id}/thumbnail.jpg"
+
+        async def create_multipart_upload(self, _key, _content_type):
+            return "fake-upload-id"
+
+        async def list_parts(self, _key, _upload_id):
+            return [StoredPart(part_number=1, etag="fake-etag", size_bytes=8)]
+
+        async def complete_multipart_upload(self, _key, _upload_id, _parts):
+            FakeR2Storage.completed = True
+
+        async def download_to_path(self, _key, destination):
+            FakeR2Storage.processing_path = destination
+            destination.write_bytes(b"fake-video")
+
+        async def put_file(self, source, _key, _content_type):
+            FakeR2Storage.thumbnail_bytes = source.read_bytes()
+
+        async def read_bytes(self, _key):
+            return FakeR2Storage.thumbnail_bytes
+
+    monkeypatch.setattr("app.media_routes.R2Storage", FakeR2Storage)
+    monkeypatch.setattr("app.media_routes.sha256_file", lambda _path: "a" * 64)
+    monkeypatch.setattr("app.media_routes.probe_video", lambda _path: (12, 1080, 1920))
+
+    def fake_thumbnail(_source, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"fake-jpeg")
+
+    monkeypatch.setattr("app.media_routes.create_thumbnail", fake_thumbnail)
+    initialized = client.post(
+        "/v1/media",
+        json={"filename": "clip.mp4", "mime_type": "video/mp4", "size_bytes": 8},
+        headers=headers,
+    ).json()
+    media_id = initialized["id"]
+    client.post(
+        f"/v1/media/{media_id}/parts/1/confirm",
+        json={"part_number": 1, "etag": "fake-etag", "size_bytes": 8},
+        headers=headers,
+    )
+
+    completed = client.post(f"/v1/media/{media_id}/complete", headers=headers)
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["status"] == "ready"
+    assert completed.json()["thumbnail_url"]
+    assert FakeR2Storage.completed is True
+    assert FakeR2Storage.thumbnail_bytes == b"fake-jpeg"
+    assert FakeR2Storage.processing_path is not None
+    assert not FakeR2Storage.processing_path.parent.exists()
 
 
 def test_draft_allows_no_platform_but_publish_requires_one(client):

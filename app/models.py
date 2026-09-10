@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -111,6 +112,10 @@ class MediaAsset(Base, TimestampMixin):
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     storage_path: Mapped[str] = mapped_column(Text)
     thumbnail_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    storage_backend: Mapped[str] = mapped_column(String(16), default="local", index=True)
+    object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    thumbnail_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    multipart_upload_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -119,6 +124,23 @@ class MediaAsset(Base, TimestampMixin):
 
     user: Mapped[User] = relationship(back_populates="media")
     posts: Mapped[list[Post]] = relationship(back_populates="media")
+    upload_parts: Mapped[list[MediaUploadPart]] = relationship(
+        back_populates="media",
+        cascade="all, delete-orphan",
+        order_by="MediaUploadPart.part_number",
+    )
+
+
+class MediaUploadPart(Base, TimestampMixin):
+    __tablename__ = "media_upload_parts"
+    __table_args__ = (PrimaryKeyConstraint("media_id", "part_number"),)
+
+    media_id: Mapped[str] = mapped_column(ForeignKey("media_assets.id", ondelete="CASCADE"))
+    part_number: Mapped[int] = mapped_column(Integer)
+    etag: Mapped[str] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+
+    media: Mapped[MediaAsset] = relationship(back_populates="upload_parts")
 
 
 class Post(Base, TimestampMixin):

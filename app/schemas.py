@@ -102,6 +102,18 @@ class MediaInitIn(BaseModel):
     size_bytes: int = Field(gt=0)
 
 
+class MediaPartConfirmIn(BaseModel):
+    part_number: int = Field(ge=1, le=10_000)
+    etag: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(gt=0)
+
+
+class MediaPartUrlOut(BaseModel):
+    part_number: int
+    url: str
+    expires_at: datetime
+
+
 class MediaOut(BaseModel):
     id: str
     original_name: str
@@ -114,6 +126,7 @@ class MediaOut(BaseModel):
     status: str
     thumbnail_url: str | None = None
     chunk_size: int | None = None
+    upload_mode: Literal["local", "r2"] = "local"
 
 
 class VersionIn(BaseModel):
