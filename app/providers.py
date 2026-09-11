@@ -124,6 +124,9 @@ class UploadPostClient:
     ) -> dict:
         platforms = [version["platform"] for version in versions]
         youtube = next((item for item in versions if item["platform"] == "youtube"), None)
+        youtube_title = str((youtube or {}).get("title") or "").strip()
+        if youtube and not youtube_title:
+            raise ProviderError("youtube_title_required", "YouTube requires a title", 422)
         fallback_title = (youtube or versions[0]).get("title") or versions[0]["caption"]
         data: dict[str, str | list[str]] = {
             "user": profile,
@@ -137,7 +140,7 @@ class UploadPostClient:
         for version in versions:
             platform = version["platform"]
             if platform == "youtube":
-                data["youtube_title"] = version.get("title") or fallback_title
+                data["youtube_title"] = youtube_title
                 data["youtube_description"] = version["caption"]
             elif platform == "facebook":
                 data["facebook_title"] = version["caption"]

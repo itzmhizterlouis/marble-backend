@@ -2,11 +2,12 @@ import hashlib
 import hmac
 import time
 
+import pytest
 import respx
 from httpx import Response
 
 from app.config import get_settings
-from app.providers import UploadPostClient, verify_upload_post_signature
+from app.providers import ProviderError, UploadPostClient, verify_upload_post_signature
 from app.tasks import provider_result_status
 
 
@@ -98,3 +99,22 @@ async def test_scheduled_submission_contains_all_platform_versions(monkeypatch, 
     ):
         assert expected in body
     assert b"tiktok" not in body
+
+
+async def test_youtube_submission_requires_an_explicit_title(tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+
+    with pytest.raises(ProviderError, match="YouTube requires a title"):
+        await UploadPostClient().publish_video(
+            profile="marble_creator",
+            video_path=video,
+            post_id="post-123",
+            revision=4,
+            versions=[
+                {"platform": "youtube", "caption": "The real caption", "title": None},
+            ],
+            scheduled_at=None,
+            timezone=None,
+            facebook_page_id=None,
+        )
