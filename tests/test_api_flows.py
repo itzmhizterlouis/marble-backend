@@ -95,6 +95,110 @@ def test_connection_metadata_and_management_handoff(client, monkeypatch):
     assert manage.json()["authorize_url"].startswith("https://app.upload-post.com/connect")
 
 
+def test_connection_sync_exposes_public_handles_and_preserves_provider_ids(client, monkeypatch):
+    email = "connection-handle@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=("tiktok", "youtube")))
+
+    async def profile(_self, username):
+        assert username.startswith("marble_")
+        return {
+            "profile": {
+                "social_accounts": {
+                    "tiktok": {
+                        "username": "-000g91dgwXgwtNwc-V8dolLsQJMUY3MQAfv",
+                        "handle": "itsuokormarvellou",
+                        "display_name": "Itsuokor Marvellous",
+                    },
+                    "youtube": {
+                        "username": "UC2wycYDhEg2a__i-o123456",
+                        "handle": "marvellousoshorenoya1175",
+                        "display_name": "Marvellous Oshorenoya",
+                    },
+                }
+            }
+        }
+
+    monkeypatch.setattr(UploadPostClient, "get_profile", profile)
+    response = client.post("/v1/connections/sync", headers=headers)
+    assert response.status_code == 200, response.text
+    accounts = {item["platform"]: item for item in response.json()}
+    assert accounts["tiktok"]["username"].startswith("-000g")
+    assert accounts["tiktok"]["handle"] == "itsuokormarvellou"
+    assert accounts["tiktok"]["display_name"] == "Itsuokor Marvellous"
+    assert accounts["youtube"]["username"].startswith("UC2wy")
+    assert accounts["youtube"]["handle"] == "marvellousoshorenoya1175"
+    assert accounts["youtube"]["display_name"] == "Marvellous Oshorenoya"
+
+    async def assert_persisted():
+        async with SessionLocal() as db:
+            user = await db.scalar(select(User).where(User.email == email))
+            rows = {
+                item.platform: item
+                for item in await db.scalars(select(SocialConnection).where(SocialConnection.user_id == user.id))
+            }
+            assert rows["youtube"].provider_account_id == "UC2wycYDhEg2a__i-o123456"
+            assert rows["youtube"].handle == "marvellousoshorenoya1175"
+
+    asyncio.run(assert_persisted())
+
+
+def test_connection_webhook_does_not_replace_public_handle_with_provider_id(client, monkeypatch):
+    email = "connection-webhook-handle@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=("youtube",)))
+
+    async def seed_connection():
+        async with SessionLocal() as db:
+            user = await db.scalar(select(User).where(User.email == email))
+            connection = await db.scalar(
+                select(SocialConnection).where(
+                    SocialConnection.user_id == user.id,
+                    SocialConnection.platform == "youtube",
+                )
+            )
+            connection.provider_account_id = "UC2wycYDhEg2a__i-o123456"
+            connection.username = "UC2wycYDhEg2a__i-o123456"
+            connection.handle = "marvellousoshorenoya1175"
+            connection.display_name = "Marvellous Oshorenoya"
+            await db.commit()
+
+    asyncio.run(seed_connection())
+    secret = "webhook-handle-secret"
+    monkeypatch.setattr(get_settings(), "upload_post_webhook_secret", secret)
+    payload = json.dumps(
+        {
+            "event": "social_account_connected",
+            "event_id": "connection-handle-webhook-1",
+            "profile_username": "marble_connection-webhook-handle",
+            "platform": "youtube",
+            "account_name": "UC2wycYDhEg2a__i-o123456",
+        }
+    ).encode()
+    timestamp = str(int(time.time()))
+    signature = hmac.new(
+        secret.encode(), timestamp.encode() + b"." + payload, hashlib.sha256
+    ).hexdigest()
+    delivered = client.post(
+        "/v1/webhooks/upload-post",
+        content=payload,
+        headers={
+            "X-Upload-Post-Signature": f"sha256={signature}",
+            "X-Upload-Post-Timestamp": timestamp,
+            "X-Upload-Post-Delivery": "connection-handle-delivery-1",
+            "Content-Type": "application/json",
+        },
+    )
+    assert delivered.status_code == 200, delivered.text
+
+    connections = client.get("/v1/connections", headers=headers)
+    youtube = next(item for item in connections.json() if item["platform"] == "youtube")
+    assert youtube["handle"] == "marvellousoshorenoya1175"
+    assert youtube["display_name"] == "Marvellous Oshorenoya"
+
+
 def test_resumable_chunk_checksum_and_offset(client):
     auth = register(client, "upload@example.com")
     asyncio.run(verify_and_connect("upload@example.com"))

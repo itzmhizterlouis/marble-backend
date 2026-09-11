@@ -88,6 +88,7 @@ class SocialConnection(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(32), default="disconnected")
     provider_account_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    handle: Mapped[str | None] = mapped_column(String(255), nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     capabilities: Mapped[list] = mapped_column(JSON, default=list)

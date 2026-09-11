@@ -75,13 +75,21 @@ async def upload_post_webhook(
             }[event_name]
             connection.reauth_required = event_name == "social_account_reauth_required"
             connection.last_synced_at = datetime.now(UTC)
-            if payload.get("account_name"):
-                connection.username = str(payload["account_name"])
-                connection.display_name = str(payload["account_name"])
             if event_name == "social_account_disconnected":
                 connection.provider_account_id = None
+                connection.username = None
+                connection.handle = None
+                connection.display_name = None
+                connection.avatar_url = None
                 connection.capabilities = []
                 connection.target_page_id = None
+            elif payload.get("account_name"):
+                # Upload-Post documents account_name as the platform identifier
+                # (for example a YouTube channel ID), not the public @handle.
+                identifier = str(payload["account_name"]).strip()
+                if identifier:
+                    connection.provider_account_id = identifier
+                    connection.username = identifier
     external_id = str(payload.get("external_id") or "").split(":")[0]
     request_id = payload.get("request_id")
     job_id = payload.get("job_id")

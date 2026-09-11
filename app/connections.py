@@ -15,11 +15,26 @@ router = APIRouter(prefix="/v1/connections", tags=["connections"])
 PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
 
 
+def _provider_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _provider_identifier(value: object) -> str | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
 def connection_out(item: SocialConnection) -> ConnectionOut:
     return ConnectionOut(
         platform=item.platform,
         status=item.status,
         username=item.username,
+        handle=item.handle,
         display_name=item.display_name,
         avatar_url=item.avatar_url,
         capabilities=item.capabilities or [],
@@ -63,14 +78,21 @@ async def sync_connections(db: AsyncSession, user: User) -> list[SocialConnectio
         if not account:
             row.status = "disconnected"
             row.reauth_required = False
-            row.username = row.display_name = row.avatar_url = None
+            row.provider_account_id = None
+            row.username = row.handle = row.display_name = row.avatar_url = None
             row.capabilities = []
             row.connected_at = None
             continue
         if isinstance(account, str):
+            identifier = _provider_text(account)
             row.status = "connected"
-            row.username = account
-            row.display_name = account
+            row.reauth_required = False
+            row.provider_account_id = identifier
+            row.username = identifier
+            row.handle = None
+            row.display_name = None
+            row.avatar_url = None
+            row.capabilities = []
         else:
             row.reauth_required = bool(account.get("reauth_required") or profile.get("reauth_required"))
             provider_status = str(account.get("status") or "").lower()
@@ -78,10 +100,16 @@ async def sync_connections(db: AsyncSession, user: User) -> list[SocialConnectio
                 row.status = provider_status
             else:
                 row.status = "expired" if row.reauth_required else "connected"
-            row.provider_account_id = str(account.get("id") or account.get("account_id") or "") or None
-            row.username = account.get("username")
-            row.display_name = account.get("display_name") or account.get("username")
-            row.avatar_url = account.get("social_images") or account.get("avatar_url")
+            provider_username = _provider_text(account.get("username"))
+            row.provider_account_id = (
+                _provider_identifier(account.get("id"))
+                or _provider_identifier(account.get("account_id"))
+                or provider_username
+            )
+            row.username = provider_username
+            row.handle = _provider_text(account.get("handle"))
+            row.display_name = _provider_text(account.get("display_name"))
+            row.avatar_url = _provider_text(account.get("social_images")) or _provider_text(account.get("avatar_url"))
             row.capabilities = account.get("capabilities") or []
         if row.status in {"connected", "needs_selection"} and not row.connected_at:
             row.connected_at = now

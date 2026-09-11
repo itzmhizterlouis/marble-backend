@@ -74,6 +74,7 @@ class ConnectionOut(BaseModel):
     status: str
     provider: Literal["upload_post"] = "upload_post"
     username: str | None = None
+    handle: str | None = None
     display_name: str | None = None
     avatar_url: str | None = None
     capabilities: list[str] = []
