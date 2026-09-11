@@ -118,3 +118,32 @@ async def test_youtube_submission_requires_an_explicit_title(tmp_path):
             timezone=None,
             facebook_page_id=None,
         )
+
+
+@respx.mock
+async def test_non_youtube_submission_omits_upload_post_generic_title(monkeypatch, tmp_path):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.post("https://provider.test/api/upload").mock(
+        return_value=Response(200, json={"job_id": "job-456"})
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+
+    await UploadPostClient().publish_video(
+        profile="marble_creator",
+        video_path=video,
+        post_id="post-456",
+        revision=1,
+        versions=[
+            {"platform": "instagram", "caption": "The real caption", "title": None},
+        ],
+        scheduled_at=None,
+        timezone=None,
+        facebook_page_id=None,
+    )
+
+    body = route.calls.last.request.content
+    assert b'name="title"' not in body
+    assert b"The real caption" in body

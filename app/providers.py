@@ -127,14 +127,17 @@ class UploadPostClient:
         youtube_title = str((youtube or {}).get("title") or "").strip()
         if youtube and not youtube_title:
             raise ProviderError("youtube_title_required", "YouTube requires a title", 422)
-        fallback_title = (youtube or versions[0]).get("title") or versions[0]["caption"]
         data: dict[str, str | list[str]] = {
             "user": profile,
-            "title": fallback_title,
             "external_id": post_id,
             "async_upload": "true",
             "platform[]": platforms,
         }
+        if youtube:
+            # Upload-Post requires its generic title for YouTube. Keep it
+            # identical to the explicit YouTube title; never derive either
+            # field from a caption or source filename.
+            data["title"] = youtube_title
         request_id = request_id or upload_request_id(post_id, revision)
         data["request_id"] = request_id
         for version in versions:
