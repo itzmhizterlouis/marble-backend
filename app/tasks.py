@@ -974,6 +974,14 @@ async def _run_ai_generation(job_id: str) -> None:
             job.completed_at = utcnow()
             await db.commit()
             return
+        if not job.media_id or job.media_id != post.media_id:
+            job.status = "failed"
+            job.error_code = "ai_generation_stale"
+            job.error_message = "The video changed before this suggestion was ready. Generate a new suggestion for the current video."
+            job.completed_at = utcnow()
+            await db.commit()
+            await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id, post_id=job.post_id)
+            return
         job.status = "processing"
         job.started_at = utcnow()
         await db.commit()
@@ -985,19 +993,24 @@ async def _run_ai_generation(job_id: str) -> None:
             if job.kind == "adjustment":
                 if not parent or not parent.candidate:
                     raise GeminiError("The previous AI suggestion is no longer available")
+                if parent.media_id != post.media_id:
+                    raise GeminiError("The video changed. Generate a new suggestion for the current video")
                 candidate, usage = await client.adjust_candidate(
                     parent.candidate,
                     job.adjustment or "regenerate",
                     job.generation_context or "",
                 )
             else:
+                media = await db.get(MediaAsset, job.media_id)
+                if not media or media.user_id != job.user_id or media.status != "ready":
+                    raise GeminiError("The selected video is no longer available")
                 async with materialize_object(
-                    storage_backend=post.media.storage_backend,
-                    object_key=post.media.object_key,
-                    storage_path=post.media.storage_path,
-                    filename=post.media.original_name,
+                    storage_backend=media.storage_backend,
+                    object_key=media.object_key,
+                    storage_path=media.storage_path,
+                    filename=media.original_name,
                 ) as video_path:
-                    gemini_file = await client.upload_file(video_path, post.media.mime_type)
+                    gemini_file = await client.upload_file(video_path, media.mime_type)
                     candidate, usage = await client.create_candidate(
                         file=gemini_file,
                         current_caption=post.caption,

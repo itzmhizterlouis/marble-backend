@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -37,6 +37,7 @@ def job_out(job: AIGenerationJob) -> dict:
     return {
         "id": job.id,
         "post_id": job.post_id,
+        "media_id": job.media_id,
         "parent_job_id": job.parent_job_id,
         "kind": job.kind,
         "adjustment": job.adjustment,
@@ -113,7 +114,15 @@ async def create_generation(payload: GenerateIn, user: User = Depends(get_curren
     # two browser tabs could both observe no active job and queue two uploads.
     await db.scalar(select(User).where(User.id == user.id).with_for_update())
     active = await db.scalar(
-        select(AIGenerationJob.id).where(AIGenerationJob.user_id == user.id, AIGenerationJob.kind == "video", AIGenerationJob.status.in_(["queued", "processing"]))
+        select(AIGenerationJob.id).where(
+            AIGenerationJob.user_id == user.id,
+            AIGenerationJob.kind == "video",
+            AIGenerationJob.status.in_(["queued", "processing"]),
+            # Preserve the one-at-a-time reservation for other drafts, but do
+            # not let a stale job for this draft block analysis of its new
+            # video after replacement.
+            or_(AIGenerationJob.post_id != post.id, AIGenerationJob.media_id == post.media_id),
+        )
     )
     if active:
         raise HTTPException(status_code=409, detail={"code": "ai_generation_in_progress", "message": "One video generation is already running"})
@@ -121,6 +130,7 @@ async def create_generation(payload: GenerateIn, user: User = Depends(get_curren
     job = AIGenerationJob(
         user_id=user.id,
         post_id=post.id,
+        media_id=post.media_id,
         kind="video",
         generation_context=payload.generation_context,
         status="queued",
@@ -145,12 +155,18 @@ async def get_latest_generation(
     db: AsyncSession = Depends(get_db),
 ):
     await require_capability(db, user, "ai_creation")
-    owns_post = await db.scalar(select(Post.id).where(Post.id == post_id, Post.user_id == user.id))
-    if not owns_post:
+    current_media_id = await db.scalar(
+        select(Post.media_id).where(Post.id == post_id, Post.user_id == user.id)
+    )
+    if not current_media_id:
         raise HTTPException(status_code=404, detail={"code": "post_not_found", "message": "Draft not found"})
     job = await db.scalar(
         select(AIGenerationJob)
-        .where(AIGenerationJob.post_id == post_id, AIGenerationJob.user_id == user.id)
+        .where(
+            AIGenerationJob.post_id == post_id,
+            AIGenerationJob.user_id == user.id,
+            AIGenerationJob.media_id == current_media_id,
+        )
         .order_by(AIGenerationJob.created_at.desc(), AIGenerationJob.id.desc())
     )
     return job_out(job) if job else None
@@ -175,10 +191,24 @@ async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends
     parent = await db.scalar(select(AIGenerationJob).where(AIGenerationJob.id == job_id, AIGenerationJob.user_id == user.id))
     if not parent or parent.status != "completed" or not parent.candidate:
         raise HTTPException(status_code=409, detail={"code": "ai_candidate_not_ready", "message": "Wait for the current suggestion to finish"})
+    current_media_id = await db.scalar(
+        select(Post.media_id).where(Post.id == parent.post_id, Post.user_id == user.id)
+    )
+    if not current_media_id:
+        raise HTTPException(status_code=404, detail={"code": "post_not_found", "message": "Draft not found"})
+    if parent.media_id != current_media_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ai_candidate_stale",
+                "message": "The video changed. Generate a new suggestion for the current video first",
+            },
+        )
     await consume_usage(db, user.id, "adjustment")
     job = AIGenerationJob(
         user_id=user.id,
         post_id=parent.post_id,
+        media_id=parent.media_id,
         parent_job_id=parent.id,
         kind="adjustment",
         adjustment=adjustment,

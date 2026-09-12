@@ -9,7 +9,16 @@ from sqlalchemy import select
 from app.analytics import normalize_metrics
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import ComplimentaryGrant, MediaAsset, Post, Publication, SocialConnection, Subscription, User
+from app.models import (
+    AIGenerationJob,
+    ComplimentaryGrant,
+    MediaAsset,
+    Post,
+    Publication,
+    SocialConnection,
+    Subscription,
+    User,
+)
 
 
 def register(client, email: str) -> tuple[dict, dict[str, str]]:
@@ -199,6 +208,7 @@ def test_pro_access_queues_one_ai_video_job_at_a_time(client, monkeypatch):
     )
     assert queued.status_code == 202, queued.text
     assert queued.json()["status"] == "queued"
+    assert queued.json()["media_id"] == post["media"]["id"]
     assert queued.json()["generation_context"] == context
     latest = client.get(f"/v1/ai/generations/latest?post_id={post['id']}", headers=headers)
     assert latest.status_code == 200, latest.text
@@ -208,6 +218,32 @@ def test_pro_access_queues_one_ai_video_job_at_a_time(client, monkeypatch):
     assert duplicate.status_code == 409
     assert duplicate.json()["code"] == "ai_generation_in_progress"
 
+    replacement_media = client.post(
+        "/v1/media",
+        headers=headers,
+        json={"filename": "replacement.mp4", "mime_type": "video/mp4", "size_bytes": 8},
+    )
+    assert replacement_media.status_code == 201, replacement_media.text
+    replacement_id = replacement_media.json()["id"]
+    asyncio.run(mark_ready([replacement_id]))
+    replaced = client.patch(
+        f"/v1/posts/{post['id']}",
+        headers=headers,
+        json={
+            "media_id": replacement_id,
+            "title": post["title"],
+            "caption": post["caption"],
+            "hashtags": post["hashtags"],
+            "versions": post["versions"],
+        },
+    )
+    assert replaced.status_code == 200, replaced.text
+    latest_after_replacement = client.get(
+        f"/v1/ai/generations/latest?post_id={post['id']}", headers=headers
+    )
+    assert latest_after_replacement.status_code == 200
+    assert latest_after_replacement.json() is None
+
     too_long = client.post(
         "/v1/ai/generations",
         headers=headers,
@@ -215,6 +251,63 @@ def test_pro_access_queues_one_ai_video_job_at_a_time(client, monkeypatch):
     )
     assert too_long.status_code == 422
     assert too_long.json()["code"] == "validation_error"
+
+
+def test_ai_adjustment_rejects_candidate_from_replaced_video(client, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "billing_enforcement_enabled", True)
+    monkeypatch.setattr(settings, "gemini_api_key", "test-gemini-key")
+    email = "stale-ai@example.com"
+    _, headers = register(client, email)
+    asyncio.run(verify_user(email, grant="pro"))
+    post = create_draft(client, headers, "stale-source")
+    monkeypatch.setattr("app.tasks.run_ai_generation.delay", lambda _job_id: None)
+    queued = client.post("/v1/ai/generations", headers=headers, json={"post_id": post["id"]})
+    assert queued.status_code == 202, queued.text
+
+    async def complete_job() -> None:
+        async with SessionLocal() as db:
+            job = await db.get(AIGenerationJob, queued.json()["id"])
+            job.status = "completed"
+            job.candidate = {
+                "shared_caption": "Caption",
+                "hashtags": [],
+                "tiktok_caption": "Caption",
+                "instagram_caption": "Caption",
+                "facebook_caption": "Caption",
+                "youtube_title": "Title",
+                "youtube_description": "Description",
+            }
+            await db.commit()
+
+    asyncio.run(complete_job())
+    replacement_media = client.post(
+        "/v1/media",
+        headers=headers,
+        json={"filename": "new-stale-source.mp4", "mime_type": "video/mp4", "size_bytes": 8},
+    )
+    assert replacement_media.status_code == 201, replacement_media.text
+    replacement_id = replacement_media.json()["id"]
+    asyncio.run(mark_ready([replacement_id]))
+    replaced = client.patch(
+        f"/v1/posts/{post['id']}",
+        headers=headers,
+        json={
+            "media_id": replacement_id,
+            "title": post["title"],
+            "caption": post["caption"],
+            "hashtags": post["hashtags"],
+            "versions": post["versions"],
+        },
+    )
+    assert replaced.status_code == 200, replaced.text
+    adjustment = client.post(
+        f"/v1/ai/generations/{queued.json()['id']}/adjust",
+        headers=headers,
+        json={"adjustment": "shorter"},
+    )
+    assert adjustment.status_code == 409
+    assert adjustment.json()["code"] == "ai_candidate_stale"
 
 
 def test_paystack_webhook_signature_and_deduplication(client, monkeypatch):

@@ -411,6 +411,11 @@ class AIGenerationJob(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     post_id: Mapped[str] = mapped_column(ForeignKey("posts.id", ondelete="CASCADE"), index=True)
+    # A post can keep its identity while its source video is replaced. Every
+    # AI result must stay attached to the exact media it reviewed.
+    media_id: Mapped[str | None] = mapped_column(
+        ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     parent_job_id: Mapped[str | None] = mapped_column(
         ForeignKey("ai_generation_jobs.id", ondelete="SET NULL"), nullable=True
     )
