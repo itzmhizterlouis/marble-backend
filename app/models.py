@@ -416,6 +416,7 @@ class AIGenerationJob(Base, TimestampMixin):
     )
     kind: Mapped[str] = mapped_column(String(24), default="video")
     adjustment: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    generation_context: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
     model: Mapped[str] = mapped_column(String(80))
     candidate: Mapped[dict | None] = mapped_column(JSON, nullable=True)

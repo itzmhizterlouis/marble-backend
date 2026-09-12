@@ -977,7 +977,7 @@ async def _run_ai_generation(job_id: str) -> None:
         job.status = "processing"
         job.started_at = utcnow()
         await db.commit()
-        await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id)
+        await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id, post_id=job.post_id)
         client = None
         gemini_file = None
         try:
@@ -985,7 +985,11 @@ async def _run_ai_generation(job_id: str) -> None:
             if job.kind == "adjustment":
                 if not parent or not parent.candidate:
                     raise GeminiError("The previous AI suggestion is no longer available")
-                candidate, usage = await client.adjust_candidate(parent.candidate, job.adjustment or "regenerate")
+                candidate, usage = await client.adjust_candidate(
+                    parent.candidate,
+                    job.adjustment or "regenerate",
+                    job.generation_context or "",
+                )
             else:
                 async with materialize_object(
                     storage_backend=post.media.storage_backend,
@@ -999,6 +1003,7 @@ async def _run_ai_generation(job_id: str) -> None:
                         current_caption=post.caption,
                         hashtags=post.hashtags or [],
                         platforms=[version.platform for version in post.versions],
+                        generation_context=job.generation_context or "",
                     )
             job.candidate = candidate
             job.status = "completed"
@@ -1017,7 +1022,7 @@ async def _run_ai_generation(job_id: str) -> None:
                     logger.warning("Could not delete Gemini file for job %s", job.id, exc_info=True)
         job.completed_at = utcnow()
         await db.commit()
-        await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id)
+        await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id, post_id=job.post_id)
 
 
 @celery_app.task(

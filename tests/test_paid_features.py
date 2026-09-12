@@ -191,12 +191,30 @@ def test_pro_access_queues_one_ai_video_job_at_a_time(client, monkeypatch):
     post = create_draft(client, headers, "ai-source")
     monkeypatch.setattr("app.tasks.run_ai_generation.delay", lambda _job_id: None)
 
-    queued = client.post("/v1/ai/generations", headers=headers, json={"post_id": post["id"]})
+    context = "This is for Nigerian creators. Keep the tone warm and end with a question."
+    queued = client.post(
+        "/v1/ai/generations",
+        headers=headers,
+        json={"post_id": post["id"], "generation_context": f"  {context}  "},
+    )
     assert queued.status_code == 202, queued.text
     assert queued.json()["status"] == "queued"
+    assert queued.json()["generation_context"] == context
+    latest = client.get(f"/v1/ai/generations/latest?post_id={post['id']}", headers=headers)
+    assert latest.status_code == 200, latest.text
+    assert latest.json()["id"] == queued.json()["id"]
+    assert latest.json()["generation_context"] == context
     duplicate = client.post("/v1/ai/generations", headers=headers, json={"post_id": post["id"]})
     assert duplicate.status_code == 409
     assert duplicate.json()["code"] == "ai_generation_in_progress"
+
+    too_long = client.post(
+        "/v1/ai/generations",
+        headers=headers,
+        json={"post_id": post["id"], "generation_context": "x" * 2001},
+    )
+    assert too_long.status_code == 422
+    assert too_long.json()["code"] == "validation_error"
 
 
 def test_paystack_webhook_signature_and_deduplication(client, monkeypatch):

@@ -132,11 +132,19 @@ class GeminiClient:
         current_caption: str,
         hashtags: list[str],
         platforms: list[str],
+        generation_context: str = "",
     ) -> tuple[dict, dict]:
+        context_instruction = (
+            f"Creator-provided additional context (use as guidance, preserve the facts, and do not invent details): "
+            f"{generation_context!r}."
+            if generation_context.strip()
+            else "No additional creator context was provided."
+        )
         prompt = (
             "Create accurate, engaging social copy for the attached creator video. Do not invent factual claims. "
             f"Selected platforms: {', '.join(platforms)}. Existing caption: {current_caption!r}. "
-            f"Existing hashtags: {', '.join(hashtags)}. Keep each platform's conventions and return only the schema."
+            f"Existing hashtags: {', '.join(hashtags)}. {context_instruction} "
+            "Keep each platform's conventions and return only the schema."
         )
         return await self._generate(
             [
@@ -145,9 +153,20 @@ class GeminiClient:
             ]
         )
 
-    async def adjust_candidate(self, candidate: dict, adjustment: str) -> tuple[dict, dict]:
+    async def adjust_candidate(
+        self,
+        candidate: dict,
+        adjustment: str,
+        generation_context: str = "",
+    ) -> tuple[dict, dict]:
+        context_instruction = (
+            f"Keep following this creator-provided context (use as guidance, preserve facts, and do not invent details): "
+            f"{generation_context!r}."
+            if generation_context.strip()
+            else "No additional creator context was provided."
+        )
         prompt = (
             f"Rewrite this social content with the adjustment '{adjustment}'. Preserve facts and return every field. "
-            f"Candidate JSON: {json.dumps(candidate, ensure_ascii=False)}"
+            f"{context_instruction} Candidate JSON: {json.dumps(candidate, ensure_ascii=False)}"
         )
         return await self._generate([{"text": prompt}])

@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from celery.exceptions import CeleryError
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -21,6 +21,12 @@ ADJUSTMENTS = {"shorter", "more_engaging", "professional", "casual", "regenerate
 
 class GenerateIn(BaseModel):
     post_id: str
+    generation_context: str = Field(default="", max_length=2000)
+
+    @field_validator("generation_context")
+    @classmethod
+    def clean_generation_context(cls, value: str) -> str:
+        return value.strip()
 
 
 class AdjustIn(BaseModel):
@@ -34,6 +40,7 @@ def job_out(job: AIGenerationJob) -> dict:
         "parent_job_id": job.parent_job_id,
         "kind": job.kind,
         "adjustment": job.adjustment,
+        "generation_context": job.generation_context or "",
         "status": job.status,
         "model": job.model,
         "candidate": job.candidate,
@@ -111,7 +118,14 @@ async def create_generation(payload: GenerateIn, user: User = Depends(get_curren
     if active:
         raise HTTPException(status_code=409, detail={"code": "ai_generation_in_progress", "message": "One video generation is already running"})
     await consume_usage(db, user.id, "video")
-    job = AIGenerationJob(user_id=user.id, post_id=post.id, kind="video", status="queued", model=get_settings().gemini_model)
+    job = AIGenerationJob(
+        user_id=user.id,
+        post_id=post.id,
+        kind="video",
+        generation_context=payload.generation_context,
+        status="queued",
+        model=get_settings().gemini_model,
+    )
     db.add(job)
     await db.commit()
     try:
@@ -122,6 +136,24 @@ async def create_generation(payload: GenerateIn, user: User = Depends(get_curren
         await db.commit()
         raise
     return job_out(job)
+
+
+@router.get("/generations/latest")
+async def get_latest_generation(
+    post_id: str = Query(min_length=1),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await require_capability(db, user, "ai_creation")
+    owns_post = await db.scalar(select(Post.id).where(Post.id == post_id, Post.user_id == user.id))
+    if not owns_post:
+        raise HTTPException(status_code=404, detail={"code": "post_not_found", "message": "Draft not found"})
+    job = await db.scalar(
+        select(AIGenerationJob)
+        .where(AIGenerationJob.post_id == post_id, AIGenerationJob.user_id == user.id)
+        .order_by(AIGenerationJob.created_at.desc(), AIGenerationJob.id.desc())
+    )
+    return job_out(job) if job else None
 
 
 @router.get("/generations/{job_id}")
@@ -144,7 +176,16 @@ async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends
     if not parent or parent.status != "completed" or not parent.candidate:
         raise HTTPException(status_code=409, detail={"code": "ai_candidate_not_ready", "message": "Wait for the current suggestion to finish"})
     await consume_usage(db, user.id, "adjustment")
-    job = AIGenerationJob(user_id=user.id, post_id=parent.post_id, parent_job_id=parent.id, kind="adjustment", adjustment=adjustment, status="queued", model=get_settings().gemini_model)
+    job = AIGenerationJob(
+        user_id=user.id,
+        post_id=parent.post_id,
+        parent_job_id=parent.id,
+        kind="adjustment",
+        adjustment=adjustment,
+        generation_context=parent.generation_context or "",
+        status="queued",
+        model=get_settings().gemini_model,
+    )
     db.add(job)
     await db.commit()
     try:
