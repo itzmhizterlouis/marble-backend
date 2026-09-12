@@ -225,6 +225,67 @@ class UploadPostClient:
     async def cancel_schedule(self, job_id: str) -> dict:
         return await self._json("DELETE", f"/uploadposts/schedule/{job_id}")
 
+    async def profile_analytics(
+        self,
+        profile: str,
+        platforms: list[str],
+        *,
+        facebook_page_id: str | None = None,
+        days: int = 30,
+    ) -> dict:
+        params: dict[str, str | int] = {
+            "platforms": ",".join(platforms),
+            "days": max(1, min(days, 365)),
+        }
+        if facebook_page_id:
+            params["page_id"] = facebook_page_id
+        return await self._json("GET", f"/analytics/{profile}", params=params)
+
+    async def total_exposure(
+        self,
+        profile: str,
+        *,
+        period: str = "last_month",
+        platforms: list[str] | None = None,
+        breakdown: bool = True,
+    ) -> dict:
+        params = {
+            "period": period,
+            "breakdown": str(breakdown).lower(),
+        }
+        if platforms:
+            params["platform"] = ",".join(platforms)
+        return await self._json("GET", f"/uploadposts/total-impressions/{profile}", params=params)
+
+    async def post_analytics(
+        self,
+        *,
+        request_id: str | None = None,
+        platform: str | None = None,
+        platform_post_id: str | None = None,
+        profile: str | None = None,
+        cached: bool = False,
+    ) -> dict:
+        if cached:
+            path = "/uploadposts/post-analytics/cached"
+        elif request_id:
+            path = f"/uploadposts/post-analytics/{request_id}"
+        else:
+            path = "/uploadposts/post-analytics"
+        params = {
+            key: value
+            for key, value in {
+                "platform": platform,
+                "platform_post_id": platform_post_id,
+                "user": profile,
+            }.items()
+            if value
+        }
+        return await self._json("GET", path, params=params)
+
+    async def analytics_metric_definitions(self) -> dict:
+        return await self._json("GET", "/uploadposts/platform-metrics")
+
 
 def verify_upload_post_signature(
     body: bytes,

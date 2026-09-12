@@ -51,3 +51,28 @@ async def send_password_reset_email(email: str, name: str, token: str) -> None:
         "Reset your Reverb password",
         f'<p>Hi {escape(name)},</p><p>This link expires in one hour.</p><p><a href="{url}">Reset password</a></p>',
     )
+
+
+async def send_payment_attention_email(email: str, name: str, grace_until: str) -> None:
+    url = f"{get_settings().frontend_url}/billing"
+    await send_transactional_email(
+        email,
+        name,
+        "Your Reverb payment needs attention",
+        f'<p>Hi {escape(name)},</p><p>Your subscription renewal did not complete. Your paid features remain available until {escape(grace_until)}.</p><p>Paystack does not automatically retry this payment, so please update your payment method or subscribe again.</p><p><a href="{url}">Review billing</a></p>',
+    )
+
+
+async def send_access_expired_email(email: str, name: str, cancelled_schedules: int) -> None:
+    url = f"{get_settings().frontend_url}/billing"
+    schedule_note = (
+        f" {cancelled_schedules} future scheduled post{'s were' if cancelled_schedules != 1 else ' was'} returned to drafts."
+        if cancelled_schedules
+        else ""
+    )
+    await send_transactional_email(
+        email,
+        name,
+        "Your Reverb paid access has ended",
+        f'<p>Hi {escape(name)},</p><p>Your paid Reverb access has ended.{escape(schedule_note)}</p><p>Your history and account settings remain available.</p><p><a href="{url}">Choose a plan</a></p>',
+    )

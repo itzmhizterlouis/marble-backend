@@ -10,7 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from .admin import router as admin_router
+from .ai import router as ai_router
+from .analytics import router as analytics_router
 from .auth import router as auth_router
+from .billing import router as billing_router
 from .config import get_settings
 from .connections import router as connections_router
 from .database import Base, SessionLocal, engine
@@ -97,6 +101,10 @@ async def unexpected_exception_handler(request: Request, exc: Exception):
 
 
 app.include_router(auth_router)
+app.include_router(billing_router)
+app.include_router(analytics_router)
+app.include_router(ai_router)
+app.include_router(admin_router)
 app.include_router(events_router)
 app.include_router(connections_router)
 app.include_router(media_router)

@@ -151,3 +151,38 @@ async def test_non_youtube_submission_omits_upload_post_generic_title(monkeypatc
     body = route.calls.last.request.content
     assert b'name="title"' not in body
     assert b"The real caption" in body
+
+
+@respx.mock
+async def test_profile_analytics_sends_required_platform_and_facebook_page(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.get("https://provider.test/api/analytics/marble_creator").mock(
+        return_value=Response(200, json={"facebook": {"reach": 40}})
+    )
+
+    result = await UploadPostClient().profile_analytics(
+        "marble_creator", ["facebook"], facebook_page_id="page-42", days=90
+    )
+
+    assert result["facebook"]["reach"] == 40
+    assert route.calls.last.request.url.params["platforms"] == "facebook"
+    assert route.calls.last.request.url.params["page_id"] == "page-42"
+    assert route.calls.last.request.url.params["days"] == "90"
+
+
+@respx.mock
+async def test_post_analytics_uses_request_id_path(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.get("https://provider.test/api/uploadposts/post-analytics/request-123").mock(
+        return_value=Response(200, json={"platforms": {"instagram": {"post_metrics": {"reach": 10}}}})
+    )
+
+    await UploadPostClient().post_analytics(request_id="request-123", platform="instagram")
+
+    assert route.called
+    assert route.calls.last.request.url.params["platform"] == "instagram"
+    assert "request_id" not in route.calls.last.request.url.params

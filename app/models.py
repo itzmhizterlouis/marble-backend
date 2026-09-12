@@ -50,6 +50,9 @@ class User(Base, TimestampMixin):
     )
     media: Mapped[list[MediaAsset]] = relationship(back_populates="user", cascade="all, delete-orphan")
     posts: Mapped[list[Post]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    subscriptions: Mapped[list[Subscription]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", foreign_keys="Subscription.user_id"
+    )
 
 
 class AuthSession(Base, TimestampMixin):
@@ -264,3 +267,161 @@ class WebhookEvent(Base):
     payload: Mapped[dict] = mapped_column(JSON)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Subscription(Base, TimestampMixin):
+    __tablename__ = "subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    plan: Mapped[str] = mapped_column(String(16), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    reference: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True, index=True)
+    paystack_customer_code: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    paystack_subscription_code: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    paystack_email_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    amount_kobo: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(8), default="NGN")
+    paid_through: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    grace_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="subscriptions", foreign_keys=[user_id])
+
+
+class BillingEvent(Base):
+    __tablename__ = "billing_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    provider_event_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ComplimentaryGrant(Base, TimestampMixin):
+    __tablename__ = "complimentary_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    plan: Mapped[str] = mapped_column(String(16))
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    granted_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class TrialUsage(Base, TimestampMixin):
+    __tablename__ = "trial_usage"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_trial_usage_user"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    post_id: Mapped[str | None] = mapped_column(ForeignKey("posts.id", ondelete="SET NULL"), nullable=True)
+    provider_account_ids: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="reserved")
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class EntitlementAuditEvent(Base):
+    __tablename__ = "entitlement_audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    actor_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FeatureFlag(Base, TimestampMixin):
+    __tablename__ = "feature_flags"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class AccountAnalyticsSnapshot(Base):
+    __tablename__ = "account_analytics_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    platform: Mapped[str] = mapped_column(String(24), index=True)
+    raw_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    normalized_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    primary_metric: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    primary_label: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_status: Mapped[str] = mapped_column(String(24), default="available")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class PublicationMetricSnapshot(Base):
+    __tablename__ = "publication_metric_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    publication_id: Mapped[str] = mapped_column(
+        ForeignKey("publications.id", ondelete="CASCADE"), index=True
+    )
+    raw_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    normalized_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    primary_metric: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    primary_label: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_status: Mapped[str] = mapped_column(String(24), default="available")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class GeneratedInsight(Base, TimestampMixin):
+    __tablename__ = "generated_insights"
+    __table_args__ = (UniqueConstraint("user_id", "period_days", name="uq_insight_user_period"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    period_days: Mapped[int] = mapped_column(Integer)
+    source_fingerprint: Mapped[str] = mapped_column(String(64))
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class AIUsageCounter(Base, TimestampMixin):
+    __tablename__ = "ai_usage_counters"
+    __table_args__ = (UniqueConstraint("user_id", "usage_date", "kind", name="uq_ai_usage_day_kind"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    usage_date: Mapped[str] = mapped_column(String(10), index=True)
+    kind: Mapped[str] = mapped_column(String(24))
+    count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AIGenerationJob(Base, TimestampMixin):
+    __tablename__ = "ai_generation_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    post_id: Mapped[str] = mapped_column(ForeignKey("posts.id", ondelete="CASCADE"), index=True)
+    parent_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ai_generation_jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(24), default="video")
+    adjustment: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    model: Mapped[str] = mapped_column(String(80))
+    candidate: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

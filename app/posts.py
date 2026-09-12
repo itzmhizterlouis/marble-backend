@@ -11,6 +11,12 @@ from sqlalchemy.orm import selectinload
 
 from .database import get_db
 from .deps import get_current_user, require_verified_user
+from .entitlements import (
+    require_capability,
+    reserve_trial_publication,
+    resolve_billing_access,
+    upgrade_required,
+)
 from .events import publish_post_event
 from .media_routes import media_out
 from .models import MediaAsset, PlatformVersion, Post, Publication, SocialConnection, User
@@ -172,6 +178,7 @@ async def replace_versions(db: AsyncSession, post: Post, versions: list[VersionI
 async def create_post(
     payload: PostUpsertIn, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
+    await require_capability(db, user, "publish")
     versions = validate_versions(payload)
     media = await db.scalar(
         select(MediaAsset).where(MediaAsset.id == payload.media_id, MediaAsset.user_id == user.id)
@@ -209,6 +216,9 @@ async def update_post(
 ):
     versions = validate_versions(payload)
     post = await owned_post(db, user, post_id, lock=True)
+    access = await resolve_billing_access(db, user)
+    if not access.capabilities["publish"] and access.trial_post_id != post.id:
+        raise upgrade_required("publish")
     if post.status not in {"draft", "cancelled"}:
         raise HTTPException(
             status_code=409,
@@ -279,6 +289,11 @@ async def publish(
     db: AsyncSession = Depends(get_db),
 ):
     post = await owned_post(db, user, post_id, lock=True)
+    access = await resolve_billing_access(db, user)
+    if not access.capabilities["publish"] and access.trial_post_id != post.id:
+        raise upgrade_required("publish", message="Your one-post preview has been used. Choose a plan to continue")
+    if payload.mode == "scheduled" and not access.capabilities["schedule"]:
+        raise upgrade_required("schedule", message="Scheduling is available on Basic and Pro")
     if post.status not in {"draft", "cancelled", "failed"}:
         return post_out(post)
     if post.media.status != "ready":
@@ -318,6 +333,17 @@ async def publish(
         raise HTTPException(
             status_code=409,
             detail={"code": "accounts_not_connected", "message": f"Reconnect: {', '.join(missing)}"},
+        )
+    if access.tier == "trial":
+        await reserve_trial_publication(
+            db,
+            user,
+            post_id=post.id,
+            provider_account_ids=[
+                item.provider_account_id or f"{item.platform}:connected"
+                for item in connections
+                if item.platform in selected
+            ],
         )
     if payload.mode == "scheduled":
         post.scheduled_at_utc = validate_schedule(payload.scheduled_at, payload.timezone)
@@ -372,6 +398,7 @@ async def update_schedule(
     user: User = Depends(require_verified_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_capability(db, user, "schedule")
     post = await owned_post(db, user, post_id, lock=True)
     if post.status != "scheduled":
         raise HTTPException(
@@ -468,6 +495,7 @@ async def update_schedule(
 async def cancel_schedule(
     post_id: str, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
+    await require_capability(db, user, "schedule")
     post = await owned_post(db, user, post_id, lock=True)
     if post.status != "scheduled":
         raise HTTPException(
@@ -516,6 +544,9 @@ async def retry_publication(
     db: AsyncSession = Depends(get_db),
 ):
     post = await owned_post(db, user, post_id, lock=True)
+    access = await resolve_billing_access(db, user)
+    if not access.capabilities["publish"] and access.trial_post_id != post.id:
+        raise upgrade_required("publish")
     publication = next((item for item in post.publications if item.platform == platform), None)
     if not publication or publication.status not in {"failed", "action_required"}:
         raise HTTPException(
@@ -593,10 +624,13 @@ async def bulk_delete_posts(
     user: User = Depends(require_verified_user),
     db: AsyncSession = Depends(get_db),
 ):
+    access = await resolve_billing_access(db, user)
     deleted_ids: list[str] = []
     failures: list[BulkDeleteFailureOut] = []
     for post_id in sorted(payload.post_ids):
         try:
+            if not access.capabilities["publish"] and access.trial_post_id != post_id:
+                raise upgrade_required("publish", message="Choose a plan to manage additional posts")
             await remove_post(db, user, post_id)
             deleted_ids.append(post_id)
         except HTTPException as exc:
@@ -616,5 +650,8 @@ async def bulk_delete_posts(
 async def delete_post(
     post_id: str, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
+    access = await resolve_billing_access(db, user)
+    if not access.capabilities["publish"] and access.trial_post_id != post_id:
+        raise upgrade_required("publish", message="Choose a plan to manage additional posts")
     await remove_post(db, user, post_id)
     return MessageOut(message="Post deleted")

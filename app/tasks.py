@@ -13,9 +13,19 @@ from sqlalchemy.orm import selectinload
 
 from .config import get_settings
 from .database import TaskSessionLocal
-from .events import publish_media_event, publish_post_event
+from .events import publish_media_event, publish_post_event, publish_realtime_event
 from .media import create_thumbnail, probe_video, sha256_file
-from .models import MediaAsset, Post, Publication, PublicationAttempt, User, utcnow
+from .models import (
+    AIGenerationJob,
+    BillingEvent,
+    MediaAsset,
+    Post,
+    Publication,
+    PublicationAttempt,
+    Subscription,
+    User,
+    utcnow,
+)
 from .notifications import deliver_pending_notifications, queue_terminal_notification
 from .providers import (
     ProviderError,
@@ -42,6 +52,9 @@ celery_app.conf.update(
             "task": "marble.deliver_post_notifications",
             "schedule": 30.0,
         },
+        "process-billing-events": {"task": "marble.process_pending_billing_events", "schedule": 30.0},
+        "sync-due-analytics": {"task": "marble.sync_due_analytics", "schedule": 86400.0},
+        "enforce-expired-access": {"task": "marble.enforce_expired_access", "schedule": 3600.0},
     },
 )
 
@@ -227,6 +240,9 @@ def normalized_results(payload: dict) -> list[dict]:
 
 
 async def apply_provider_payload(post: Post, payload: dict) -> None:
+    previously_published = {
+        item.platform for item in post.publications if item.status == "published"
+    }
     source_request_id = payload.get("request_id")
     source_job_id = payload.get("job_id")
     by_platform = {item.platform: item for item in post.publications}
@@ -270,6 +286,12 @@ async def apply_provider_payload(post: Post, payload: dict) -> None:
         post.media.delete_after = utcnow() + timedelta(hours=24)
     elif post.status in {"failed", "partially_published"}:
         post.media.delete_after = utcnow() + timedelta(days=7)
+    newly_published = {
+        item.platform for item in post.publications if item.status == "published"
+    } - previously_published
+    if newly_published and settings.environment.lower() != "test":
+        for countdown in (3600, 21600, 86400):
+            sync_analytics.apply_async(args=[post.user_id, True], countdown=countdown)
 
 
 async def record_provider_attempt(
@@ -838,3 +860,235 @@ async def _cleanup_media() -> None:
 @celery_app.task(name="marble.cleanup_media")
 def cleanup_media() -> None:
     asyncio.run(_cleanup_media())
+
+
+async def _process_billing_event(event_id: str) -> None:
+    from .billing import apply_billing_event
+
+    async with TaskSessionLocal() as db:
+        event = await db.get(BillingEvent, event_id)
+        if event:
+            await apply_billing_event(db, event)
+
+
+@celery_app.task(
+    name="marble.process_billing_event",
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    max_retries=5,
+)
+def process_billing_event(event_id: str) -> None:
+    asyncio.run(_process_billing_event(event_id))
+
+
+async def _process_pending_billing_events() -> None:
+    from .billing import apply_billing_event
+
+    async with TaskSessionLocal() as db:
+        events = list(
+            await db.scalars(
+                select(BillingEvent).where(BillingEvent.processed_at.is_(None)).order_by(BillingEvent.created_at).limit(100)
+            )
+        )
+        for event in events:
+            await apply_billing_event(db, event)
+
+
+@celery_app.task(name="marble.process_pending_billing_events")
+def process_pending_billing_events() -> None:
+    asyncio.run(_process_pending_billing_events())
+
+
+async def _sync_analytics(user_id: str, force: bool = False) -> None:
+    from .analytics import sync_user_analytics
+    from .entitlements import resolve_billing_access
+
+    async with TaskSessionLocal() as db:
+        user = await db.get(User, user_id)
+        if not user:
+            return
+        access = await resolve_billing_access(db, user)
+        if not access.capabilities["analytics"]:
+            return
+        await sync_user_analytics(db, user, force=force)
+        await publish_realtime_event(user.id, "analytics.updated")
+
+
+@celery_app.task(
+    name="marble.sync_analytics",
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    max_retries=3,
+)
+def sync_analytics(user_id: str, force: bool = False) -> None:
+    asyncio.run(_sync_analytics(user_id, force))
+
+
+async def _sync_due_analytics() -> None:
+    from .entitlements import resolve_billing_access
+    from .models import AccountAnalyticsSnapshot, PublicationMetricSnapshot
+
+    async with TaskSessionLocal() as db:
+        users = list(await db.scalars(select(User).where(User.email_verified.is_(True))))
+        eligible = [user.id for user in users if (await resolve_billing_access(db, user)).capabilities["analytics"]]
+        retention_cutoff = utcnow() - timedelta(days=396)
+        old_account_snapshots = list(
+            await db.scalars(
+                select(AccountAnalyticsSnapshot).where(AccountAnalyticsSnapshot.captured_at < retention_cutoff)
+            )
+        )
+        old_publication_snapshots = list(
+            await db.scalars(
+                select(PublicationMetricSnapshot).where(PublicationMetricSnapshot.captured_at < retention_cutoff)
+            )
+        )
+        for snapshot in [*old_account_snapshots, *old_publication_snapshots]:
+            await db.delete(snapshot)
+        await db.commit()
+    for user_id in eligible:
+        sync_analytics.delay(user_id)
+
+
+@celery_app.task(name="marble.sync_due_analytics")
+def sync_due_analytics() -> None:
+    asyncio.run(_sync_due_analytics())
+
+
+async def _run_ai_generation(job_id: str) -> None:
+    from .gemini import GeminiClient, GeminiError
+
+    async with TaskSessionLocal() as db:
+        job = await db.scalar(select(AIGenerationJob).where(AIGenerationJob.id == job_id))
+        if not job or job.status != "queued":
+            return
+        post = await db.scalar(
+            select(Post)
+            .where(Post.id == job.post_id)
+            .options(selectinload(Post.media), selectinload(Post.versions))
+        )
+        parent = await db.get(AIGenerationJob, job.parent_job_id) if job.parent_job_id else None
+        if not post:
+            job.status = "failed"
+            job.error_code = "post_not_found"
+            job.error_message = "The draft is no longer available"
+            job.completed_at = utcnow()
+            await db.commit()
+            return
+        job.status = "processing"
+        job.started_at = utcnow()
+        await db.commit()
+        await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id)
+        client = None
+        gemini_file = None
+        try:
+            client = GeminiClient()
+            if job.kind == "adjustment":
+                if not parent or not parent.candidate:
+                    raise GeminiError("The previous AI suggestion is no longer available")
+                candidate, usage = await client.adjust_candidate(parent.candidate, job.adjustment or "regenerate")
+            else:
+                async with materialize_object(
+                    storage_backend=post.media.storage_backend,
+                    object_key=post.media.object_key,
+                    storage_path=post.media.storage_path,
+                    filename=post.media.original_name,
+                ) as video_path:
+                    gemini_file = await client.upload_file(video_path, post.media.mime_type)
+                    candidate, usage = await client.create_candidate(
+                        file=gemini_file,
+                        current_caption=post.caption,
+                        hashtags=post.hashtags or [],
+                        platforms=[version.platform for version in post.versions],
+                    )
+            job.candidate = candidate
+            job.status = "completed"
+            job.input_tokens = usage.get("promptTokenCount")
+            job.output_tokens = usage.get("candidatesTokenCount")
+        except Exception as exc:
+            logger.info("AI generation %s failed: %s", job.id, exc)
+            job.status = "failed"
+            job.error_code = "ai_generation_failed"
+            job.error_message = str(exc)
+        finally:
+            if client and gemini_file and gemini_file.get("name"):
+                try:
+                    await client.delete_file(gemini_file["name"])
+                except Exception:
+                    logger.warning("Could not delete Gemini file for job %s", job.id, exc_info=True)
+        job.completed_at = utcnow()
+        await db.commit()
+        await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id)
+
+
+@celery_app.task(
+    name="marble.run_ai_generation",
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    max_retries=3,
+)
+def run_ai_generation(job_id: str) -> None:
+    asyncio.run(_run_ai_generation(job_id))
+
+
+async def _enforce_expired_access() -> None:
+    from .email import send_access_expired_email
+    from .entitlements import resolve_billing_access
+
+    now = utcnow()
+    async with TaskSessionLocal() as db:
+        expired_subscriptions = list(
+            await db.scalars(
+                select(Subscription).where(
+                    Subscription.status == "grace",
+                    Subscription.grace_until.is_not(None),
+                    Subscription.grace_until <= now,
+                )
+            )
+        )
+        for subscription in expired_subscriptions:
+            subscription.status = "expired"
+        scheduled_posts = list(
+            await db.scalars(
+                select(Post)
+                .where(Post.status == "scheduled")
+                .options(selectinload(Post.user), selectinload(Post.publications), selectinload(Post.media))
+            )
+        )
+        changed: list[tuple[str, str]] = []
+        cancelled_by_user: dict[str, int] = {}
+        for post in scheduled_posts:
+            access = await resolve_billing_access(db, post.user)
+            if access.capabilities["schedule"]:
+                continue
+            if post.provider_job_id:
+                try:
+                    await UploadPostClient().cancel_schedule(post.provider_job_id)
+                except ProviderError:
+                    continue
+            post.status = "draft"
+            post.publish_mode = None
+            post.scheduled_at_utc = None
+            post.schedule_timezone = None
+            post.provider_job_id = None
+            post.provider_request_id = None
+            post.media.delete_after = now + timedelta(days=7)
+            for publication in list(post.publications):
+                await db.delete(publication)
+            changed.append((post.user_id, post.id))
+            cancelled_by_user[post.user_id] = cancelled_by_user.get(post.user_id, 0) + 1
+        await db.commit()
+    for user_id, post_id in changed:
+        await publish_post_event(user_id, post_id)
+    for user_id, count in cancelled_by_user.items():
+        async with TaskSessionLocal() as db:
+            user = await db.get(User, user_id)
+            if user:
+                try:
+                    await send_access_expired_email(user.email, user.name, count)
+                except Exception:
+                    logger.warning("Could not deliver access-expiry email to %s", user_id, exc_info=True)
+
+
+@celery_app.task(name="marble.enforce_expired_access")
+def enforce_expired_access() -> None:
+    asyncio.run(_enforce_expired_access())

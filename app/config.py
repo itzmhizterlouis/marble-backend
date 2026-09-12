@@ -39,8 +39,21 @@ class Settings(BaseSettings):
     upload_chunk_bytes: int = 2 * 1024 * 1024
     access_token_minutes: int = 15
     refresh_token_days: int = 30
+    paystack_secret_key: str = ""
+    paystack_basic_plan_code: str = ""
+    paystack_pro_plan_code: str = ""
+    paystack_callback_url: str = "http://localhost:4173/billing/callback"
+    admin_emails: str = ""
+    billing_enforcement_enabled: bool = False
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    ai_enabled: bool = True
+    ai_video_daily_limit: int = 20
+    ai_adjustment_daily_limit: int = 100
+    ai_global_video_daily_limit: int = 1000
+    ai_global_adjustment_daily_limit: int = 5000
 
-    @field_validator("frontend_url", "api_public_url", mode="before")
+    @field_validator("frontend_url", "api_public_url", "paystack_callback_url", mode="before")
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
@@ -92,11 +105,25 @@ class Settings(BaseSettings):
             missing_r2 = [name for name, value in r2_required.items() if not value]
             if missing_r2:
                 raise ValueError(f"Missing production settings: {', '.join(missing_r2)}")
+        if self.billing_enforcement_enabled:
+            billing_required = {
+                "PAYSTACK_SECRET_KEY": self.paystack_secret_key,
+                "PAYSTACK_BASIC_PLAN_CODE": self.paystack_basic_plan_code,
+                "PAYSTACK_PRO_PLAN_CODE": self.paystack_pro_plan_code,
+                "PAYSTACK_CALLBACK_URL": self.paystack_callback_url,
+            }
+            missing_billing = [name for name, value in billing_required.items() if not value]
+            if missing_billing:
+                raise ValueError(f"Missing production settings: {', '.join(missing_billing)}")
         return self
 
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"
+
+    @property
+    def admin_email_set(self) -> set[str]:
+        return {email.strip().casefold() for email in self.admin_emails.split(",") if email.strip()}
 
     def ensure_storage(self) -> None:
         (self.storage_root / "uploads").mkdir(parents=True, exist_ok=True)

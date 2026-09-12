@@ -18,6 +18,7 @@ from starlette.requests import ClientDisconnect
 from .config import get_settings
 from .database import get_db
 from .deps import get_current_user, require_verified_user
+from .entitlements import require_capability
 from .events import publish_media_event
 from .media import append_chunk, parse_content_range
 from .models import MediaAsset, MediaUploadPart, Post, User
@@ -103,6 +104,7 @@ async def owned_media(db: AsyncSession, user: User, media_id: str, *, lock: bool
 async def initialize_media(
     payload: MediaInitIn, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
+    await require_capability(db, user, "publish")
     settings = get_settings()
     if payload.size_bytes > settings.max_upload_bytes:
         raise HTTPException(
@@ -616,6 +618,7 @@ async def thumbnail(media_id: str, token: str = Query(...), db: AsyncSession = D
 async def delete_media(
     media_id: str, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
+    await require_capability(db, user, "publish")
     asset = await owned_media(db, user, media_id)
     count = await db.scalar(select(func.count(Post.id)).where(Post.media_id == asset.id))
     if count:
