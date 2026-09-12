@@ -109,6 +109,19 @@ class UploadPostClient:
         body = await self._json("GET", "/uploadposts/facebook/pages", params={"profile": username})
         return body.get("pages", [])
 
+    @staticmethod
+    def _generic_upload_title(versions: list[dict], youtube_title: str) -> str:
+        """Return a safe Upload-Post fallback title for mixed-platform uploads."""
+        if len(versions) == 1:
+            return youtube_title
+        for version in versions:
+            if version.get("platform") == "youtube":
+                continue
+            caption = str(version.get("caption") or "").strip()
+            if caption:
+                return caption[:100]
+        return youtube_title
+
     async def publish_video(
         self,
         *,
@@ -134,10 +147,12 @@ class UploadPostClient:
             "platform[]": platforms,
         }
         if youtube:
-            # Upload-Post requires its generic title for YouTube. Keep it
-            # identical to the explicit YouTube title; never derive either
-            # field from a caption or source filename.
-            data["title"] = youtube_title
+            # Upload-Post requires a generic title when YouTube is selected,
+            # but that field is a fallback for every destination. In a mixed
+            # upload, use a non-YouTube caption as the fallback so the explicit
+            # YouTube title cannot become another platform's caption. The
+            # platform-specific fields below remain authoritative.
+            data["title"] = self._generic_upload_title(versions, youtube_title)
         request_id = request_id or upload_request_id(post_id, revision)
         data["request_id"] = request_id
         for version in versions:

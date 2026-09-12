@@ -98,6 +98,10 @@ async def test_scheduled_submission_contains_all_platform_versions(monkeypatch, 
         request.headers["x-request-id"].encode(),
     ):
         assert expected in body
+    assert b'name="title"\r\n\r\nInstagram copy\r\n' in body
+    assert b'name="instagram_title"\r\n\r\nInstagram copy\r\n' in body
+    assert b'name="youtube_title"\r\n\r\nVideo title\r\n' in body
+    assert b'name="youtube_description"\r\n\r\nYouTube copy\r\n' in body
     assert b"tiktok" not in body
 
 
