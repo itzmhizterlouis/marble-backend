@@ -276,6 +276,7 @@ def test_ai_adjustment_rejects_candidate_from_replaced_video(client, monkeypatch
                 "hashtags": [],
                 "tiktok_caption": "Caption",
                 "instagram_caption": "Caption",
+                "facebook_title": "Facebook title",
                 "facebook_caption": "Caption",
                 "youtube_title": "Title",
                 "youtube_description": "Description",

@@ -13,6 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .config import get_settings
+from .content import (
+    CompiledPlatformContent,
+    ContentValidationError,
+    compile_and_validate,
+    validate_ai_candidate,
+)
 from .database import TaskSessionLocal
 from .events import publish_media_event, publish_post_event, publish_realtime_event
 from .media import create_thumbnail, probe_video, sha256_file
@@ -66,6 +72,19 @@ def filename_derived_title(title: str | None, filename: str) -> bool:
         return False
     generated_title = Path(filename).stem.replace("-", " ").replace("_", " ").strip()
     return bool(generated_title) and title.strip().casefold() == generated_title.casefold()
+
+
+def compile_post_content(post: Post, versions: list) -> list[CompiledPlatformContent]:
+    try:
+        return compile_and_validate(
+            shared_caption=post.caption,
+            hashtags=post.hashtags or [],
+            versions=versions,
+            content_format_version=post.content_format_version or 1,
+        )
+    except ContentValidationError as exc:
+        message = next(iter(exc.field_errors.values()), str(exc))
+        raise ProviderError("content_validation_failed", message, 422) from exc
 
 
 async def _process_media(media_id: str) -> None:
@@ -370,6 +389,13 @@ async def _publish_post(post_id: str) -> None:
                     "Set a YouTube title before publishing",
                     422,
                 )
+            compiled_versions = compile_post_content(post, post.versions)
+            compiled_by_platform = {item.platform: item for item in compiled_versions}
+            for publication in post.publications:
+                content = compiled_by_platform[publication.platform]
+                publication.submitted_caption = content.caption
+                publication.submitted_title = content.title
+                publication.submitted_hashtags = content.hashtags
             async with materialize_object(
                 storage_backend=post.media.storage_backend,
                 object_key=post.media.object_key,
@@ -386,9 +412,8 @@ async def _publish_post(post_id: str) -> None:
                             "platform": item.platform,
                             "caption": item.caption,
                             "title": item.title,
-                            "options": item.options,
                         }
-                        for item in post.versions
+                        for item in compiled_versions
                     ],
                     scheduled_at=post.scheduled_at_utc.isoformat() if post.scheduled_at_utc else None,
                     timezone=post.schedule_timezone,
@@ -647,6 +672,10 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                     "Set a YouTube title before retrying",
                     422,
                 )
+            compiled_version = compile_post_content(post, [version])[0]
+            publication.submitted_caption = compiled_version.caption
+            publication.submitted_title = compiled_version.title
+            publication.submitted_hashtags = compiled_version.hashtags
             async with materialize_object(
                 storage_backend=post.media.storage_backend,
                 object_key=post.media.object_key,
@@ -660,10 +689,9 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                     revision=post.schedule_revision,
                     versions=[
                         {
-                            "platform": version.platform,
-                            "caption": version.caption,
-                            "title": version.title,
-                            "options": version.options,
+                            "platform": compiled_version.platform,
+                            "caption": compiled_version.caption,
+                            "title": compiled_version.title,
                         }
                     ],
                     scheduled_at=None,
@@ -1082,6 +1110,13 @@ async def _run_ai_generation(job_id: str) -> None:
                         platforms=[version.platform for version in post.versions],
                         generation_context=job.generation_context or "",
                     )
+            try:
+                candidate = validate_ai_candidate(
+                    candidate, [version.platform for version in post.versions]
+                )
+            except ContentValidationError as exc:
+                reason = next(iter(exc.field_errors.values()), "invalid platform content")
+                raise GeminiError(f"AI suggestion needs regeneration: {reason}") from exc
             job.candidate = candidate
             job.status = "completed"
             job.input_tokens = usage.get("promptTokenCount")

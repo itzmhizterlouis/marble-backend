@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from .content import ContentValidationError, compile_and_validate, normalize_hashtags
 from .database import get_db
 from .deps import get_current_user, require_verified_user
 from .entitlements import (
@@ -85,6 +86,7 @@ def post_out(post: Post) -> PostOut:
         title=post.title,
         caption=post.caption,
         hashtags=post.hashtags or [],
+        content_format_version=post.content_format_version or 1,
         status=post.status,
         publish_mode=post.publish_mode,
         scheduled_at=post.scheduled_at_utc,
@@ -93,7 +95,11 @@ def post_out(post: Post) -> PostOut:
         can_edit_schedule=post.status == "scheduled" and bool(post.provider_job_id),
         versions=[
             VersionIn(
-                platform=item.platform, caption=item.caption, title=item.title, options=item.options or {}
+                platform=item.platform,
+                caption=item.caption,
+                title=item.title,
+                use_shared_caption=item.use_shared_caption,
+                options=item.options or {},
             )
             for item in post.versions
         ],
@@ -107,6 +113,9 @@ def post_out(post: Post) -> PostOut:
                 error_message=item.error_message,
                 fallback_to_inbox=item.fallback_to_inbox,
                 published_at=item.published_at,
+                submitted_caption=item.submitted_caption,
+                submitted_title=item.submitted_title,
+                submitted_hashtags=item.submitted_hashtags,
             )
             for item in post.publications
         ],
@@ -146,17 +155,43 @@ def validate_versions(
         raise HTTPException(
             status_code=422, detail={"code": "duplicate_platform", "message": "Each platform can appear once"}
         )
-    if for_publish and any(not item.caption.strip() for item in versions):
+    return versions
+
+
+def normalize_payload_hashtags(payload: PostUpsertIn | ScheduleUpdateIn) -> None:
+    if payload.hashtags is None:
+        return
+    try:
+        payload.hashtags = normalize_hashtags(payload.hashtags)
+    except ContentValidationError as exc:
         raise HTTPException(
             status_code=422,
-            detail={"code": "caption_required", "message": "Add a caption for every platform"},
+            detail={
+                "code": "content_validation_failed",
+                "message": "Check the highlighted content fields",
+                "field_errors": exc.field_errors,
+            },
+        ) from exc
+
+
+def validate_publish_input(payload: PostUpsertIn) -> None:
+    versions = validate_versions(payload, for_publish=True)
+    try:
+        compile_and_validate(
+            shared_caption=payload.caption,
+            hashtags=payload.hashtags,
+            versions=versions,
+            content_format_version=payload.content_format_version,
         )
-    youtube = next((item for item in versions if item.platform == "youtube"), None)
-    if for_publish and youtube and not (youtube.title or "").strip():
+    except ContentValidationError as exc:
         raise HTTPException(
-            status_code=422, detail={"code": "youtube_title_required", "message": "YouTube requires a title"}
-        )
-    return versions
+            status_code=422,
+            detail={
+                "code": "content_validation_failed",
+                "message": "Check the highlighted content fields",
+                "field_errors": exc.field_errors,
+            },
+        ) from exc
 
 
 async def replace_versions(db: AsyncSession, post: Post, versions: list[VersionIn]) -> None:
@@ -168,6 +203,7 @@ async def replace_versions(db: AsyncSession, post: Post, versions: list[VersionI
                 platform=item.platform,
                 caption=item.caption.strip(),
                 title=item.title.strip() if item.title else None,
+                use_shared_caption=item.use_shared_caption,
                 options=item.options,
             )
         )
@@ -179,6 +215,7 @@ async def create_post(
     payload: PostUpsertIn, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
     await require_capability(db, user, "publish")
+    normalize_payload_hashtags(payload)
     versions = validate_versions(payload)
     media = await db.scalar(
         select(MediaAsset).where(MediaAsset.id == payload.media_id, MediaAsset.user_id == user.id)
@@ -199,6 +236,7 @@ async def create_post(
         title=payload.title.strip(),
         caption=payload.caption.strip(),
         hashtags=payload.hashtags,
+        content_format_version=payload.content_format_version,
     )
     db.add(post)
     await db.flush()
@@ -214,6 +252,7 @@ async def update_post(
     user: User = Depends(require_verified_user),
     db: AsyncSession = Depends(get_db),
 ):
+    normalize_payload_hashtags(payload)
     versions = validate_versions(payload)
     post = await owned_post(db, user, post_id, lock=True)
     access = await resolve_billing_access(db, user)
@@ -243,6 +282,7 @@ async def update_post(
             )
         post.media_id = media.id
     post.title, post.caption, post.hashtags = payload.title.strip(), payload.caption.strip(), payload.hashtags
+    post.content_format_version = payload.content_format_version
     post.status = "draft"
     await replace_versions(db, post, versions)
     await db.commit()
@@ -301,24 +341,24 @@ async def publish(
             status_code=409,
             detail={"code": "media_not_ready", "message": "Finish uploading the video first"},
         )
-    validate_versions(
-        PostUpsertIn(
+    publish_input = PostUpsertIn(
             media_id=post.media_id,
             title=post.title,
             caption=post.caption,
             hashtags=post.hashtags or [],
+            content_format_version=post.content_format_version or 1,
             versions=[
                 VersionIn(
                     platform=item.platform,
                     caption=item.caption,
                     title=item.title,
+                    use_shared_caption=item.use_shared_caption,
                     options=item.options or {},
                 )
                 for item in post.versions
             ],
-        ),
-        for_publish=True,
     )
+    validate_publish_input(publish_input)
     selected = {item.platform for item in post.versions}
     connections = list(
         await db.scalars(
@@ -417,7 +457,14 @@ async def update_schedule(
             },
         )
     has_content_changes = any(
-        value is not None for value in (payload.title, payload.caption, payload.hashtags, payload.versions)
+        value is not None
+        for value in (
+            payload.title,
+            payload.caption,
+            payload.hashtags,
+            payload.versions,
+            payload.content_format_version,
+        )
     )
     scheduled_at = validate_schedule(
         payload.scheduled_at or post.scheduled_at_utc, payload.timezone or post.schedule_timezone
@@ -431,16 +478,34 @@ async def update_schedule(
             )
             post.scheduled_at_utc, post.schedule_timezone = scheduled_at, timezone
         else:
+            normalize_payload_hashtags(payload)
             versions = (
-                validate_versions(payload, for_publish=True)
+                validate_versions(payload)
                 if payload.versions is not None
                 else [
                     VersionIn(
-                        platform=item.platform, caption=item.caption, title=item.title, options=item.options
+                        platform=item.platform,
+                        caption=item.caption,
+                        title=item.title,
+                        use_shared_caption=item.use_shared_caption,
+                        options=item.options,
                     )
                     for item in post.versions
                 ]
             )
+            next_input = PostUpsertIn(
+                media_id=post.media_id,
+                title=payload.title if payload.title is not None else post.title,
+                caption=payload.caption if payload.caption is not None else post.caption,
+                hashtags=payload.hashtags if payload.hashtags is not None else (post.hashtags or []),
+                versions=versions,
+                content_format_version=(
+                    payload.content_format_version
+                    if payload.content_format_version is not None
+                    else (post.content_format_version or 1)
+                ),
+            )
+            validate_publish_input(next_input)
             await client.cancel_schedule(post.provider_job_id)
             if payload.title is not None:
                 post.title = payload.title.strip()
@@ -448,6 +513,8 @@ async def update_schedule(
                 post.caption = payload.caption.strip()
             if payload.hashtags is not None:
                 post.hashtags = payload.hashtags
+            if payload.content_format_version is not None:
+                post.content_format_version = payload.content_format_version
             if payload.versions is not None:
                 await replace_versions(db, post, versions)
             post.scheduled_at_utc, post.schedule_timezone = scheduled_at, timezone

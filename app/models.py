@@ -158,6 +158,7 @@ class Post(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255), default="")
     caption: Mapped[str] = mapped_column(Text, default="")
     hashtags: Mapped[list] = mapped_column(JSON, default=list)
+    content_format_version: Mapped[int] = mapped_column(Integer, default=2)
     status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
     publish_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     scheduled_at_utc: Mapped[datetime | None] = mapped_column(
@@ -190,6 +191,7 @@ class PlatformVersion(Base, TimestampMixin):
     platform: Mapped[str] = mapped_column(String(24))
     caption: Mapped[str] = mapped_column(Text)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    use_shared_caption: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     options: Mapped[dict] = mapped_column(JSON, default=dict)
 
     post: Mapped[Post] = relationship(back_populates="versions")
@@ -212,6 +214,9 @@ class Publication(Base, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     fallback_to_inbox: Mapped[bool] = mapped_column(Boolean, default=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    submitted_caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    submitted_hashtags: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     post: Mapped[Post] = relationship(back_populates="publications")
     provider_attempts: Mapped[list[PublicationAttempt]] = relationship(

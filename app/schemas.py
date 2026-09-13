@@ -135,6 +135,7 @@ class VersionIn(BaseModel):
     platform: Platform
     caption: str = Field(default="", max_length=63206)
     title: str | None = Field(default=None, max_length=255)
+    use_shared_caption: bool | None = None
     options: dict = Field(default_factory=dict)
 
 
@@ -144,6 +145,7 @@ class PostUpsertIn(BaseModel):
     caption: str = Field(default="", max_length=63206)
     hashtags: list[str] = Field(default_factory=list)
     versions: list[VersionIn] = Field(default_factory=list)
+    content_format_version: Literal[1, 2] = 1
 
 
 class PublishIn(BaseModel):
@@ -166,6 +168,7 @@ class ScheduleUpdateIn(BaseModel):
     caption: str | None = Field(default=None, max_length=63206)
     hashtags: list[str] | None = None
     versions: list[VersionIn] | None = None
+    content_format_version: Literal[1, 2] | None = None
 
 
 class PublicationOut(BaseModel):
@@ -177,6 +180,9 @@ class PublicationOut(BaseModel):
     error_message: str | None = None
     fallback_to_inbox: bool = False
     published_at: datetime | None = None
+    submitted_caption: str | None = None
+    submitted_title: str | None = None
+    submitted_hashtags: list[str] | None = None
 
 
 class PostOut(BaseModel):
@@ -185,6 +191,7 @@ class PostOut(BaseModel):
     title: str
     caption: str
     hashtags: list[str]
+    content_format_version: Literal[1, 2]
     status: str
     publish_mode: str | None
     scheduled_at: datetime | None

@@ -114,6 +114,16 @@ class UploadPostClient:
         """Return a safe Upload-Post fallback title for mixed-platform uploads."""
         if len(versions) == 1:
             return youtube_title
+        facebook = next(
+            (version for version in versions if version.get("platform") == "facebook"),
+            None,
+        )
+        if facebook:
+            facebook_fallback = str(
+                facebook.get("title") or facebook.get("caption") or ""
+            ).strip()
+            if facebook_fallback:
+                return facebook_fallback[:100]
         for version in versions:
             if version.get("platform") == "youtube":
                 continue
@@ -161,7 +171,8 @@ class UploadPostClient:
                 data["youtube_title"] = youtube_title
                 data["youtube_description"] = version["caption"]
             elif platform == "facebook":
-                data["facebook_title"] = version["caption"]
+                if version.get("title"):
+                    data["facebook_title"] = version["title"]
                 data["facebook_description"] = version["caption"]
                 data["facebook_media_type"] = "REELS"
             else:

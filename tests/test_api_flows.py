@@ -458,9 +458,20 @@ def test_retry_submits_only_the_failed_platform(client, monkeypatch):
             "media_id": media["id"],
             "title": "Retry one destination",
             "caption": "Platform-specific retry",
+            "hashtags": ["Reverb"],
+            "content_format_version": 2,
             "versions": [
-                {"platform": "instagram", "caption": "Already live"},
-                {"platform": "youtube", "caption": "Retry me", "title": "Retry me"},
+                {
+                    "platform": "instagram",
+                    "caption": "Already live",
+                    "options": {"separate_caption": True},
+                },
+                {
+                    "platform": "youtube",
+                    "caption": "Retry me",
+                    "title": "Retry me",
+                    "options": {"separate_caption": True},
+                },
             ],
         },
         headers=headers,
@@ -509,11 +520,18 @@ def test_retry_submits_only_the_failed_platform(client, monkeypatch):
     monkeypatch.setattr(UploadPostClient, "publish_video", publish_one)
     asyncio.run(_retry_platform(draft["id"], "youtube"))
     assert [version["platform"] for version in captured["versions"]] == ["youtube"]
+    assert captured["versions"][0]["caption"] == "Retry me #Reverb"
+    assert captured["versions"][0]["title"] == "Retry me"
     completed = client.get(f"/v1/posts/{draft['id']}", headers=headers).json()
     assert {item["platform"]: item["status"] for item in completed["publications"]} == {
         "instagram": "published",
         "youtube": "published",
     }
+    youtube_result = next(
+        item for item in completed["publications"] if item["platform"] == "youtube"
+    )
+    assert youtube_result["submitted_caption"] == "Retry me #Reverb"
+    assert youtube_result["submitted_title"] == "Retry me"
 
 
 def test_retry_reconciles_late_success_without_posting_again(client, monkeypatch):
@@ -791,7 +809,8 @@ def test_shared_schedule_creation_and_publish_validation(client, monkeypatch):
         f"/v1/posts/{second.json()['id']}/publish", json={"mode": "now"}, headers=headers
     )
     assert rejected.status_code == 422
-    assert rejected.json()["code"] == "caption_required"
+    assert rejected.json()["code"] == "content_validation_failed"
+    assert rejected.json()["field_errors"]["versions.tiktok.caption"] == "Add a caption"
 
 
 def test_webhook_signature_and_deduplication(client, monkeypatch):

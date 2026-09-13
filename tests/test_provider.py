@@ -125,6 +125,62 @@ async def test_youtube_submission_requires_an_explicit_title(tmp_path):
 
 
 @respx.mock
+async def test_facebook_caption_and_optional_title_use_separate_fields(monkeypatch, tmp_path):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.post("https://provider.test/api/upload").mock(
+        return_value=Response(200, json={"request_id": "facebook-request"})
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+
+    await UploadPostClient().publish_video(
+        profile="marble_creator",
+        video_path=video,
+        post_id="facebook-post",
+        revision=1,
+        versions=[
+            {"platform": "facebook", "caption": "Full Facebook caption", "title": "Short title"}
+        ],
+        scheduled_at=None,
+        timezone=None,
+        facebook_page_id="page-1",
+    )
+
+    body = route.calls.last.request.content
+    assert b'name="facebook_title"\r\n\r\nShort title\r\n' in body
+    assert b'name="facebook_description"\r\n\r\nFull Facebook caption\r\n' in body
+
+
+@respx.mock
+async def test_facebook_title_is_omitted_when_creator_leaves_it_empty(monkeypatch, tmp_path):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.post("https://provider.test/api/upload").mock(
+        return_value=Response(200, json={"request_id": "facebook-request"})
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+
+    await UploadPostClient().publish_video(
+        profile="marble_creator",
+        video_path=video,
+        post_id="facebook-post",
+        revision=1,
+        versions=[{"platform": "facebook", "caption": "Full Facebook caption", "title": None}],
+        scheduled_at=None,
+        timezone=None,
+        facebook_page_id="page-1",
+    )
+
+    body = route.calls.last.request.content
+    assert b'name="facebook_title"' not in body
+    assert b'name="facebook_description"\r\n\r\nFull Facebook caption\r\n' in body
+
+
+@respx.mock
 async def test_non_youtube_submission_omits_upload_post_generic_title(monkeypatch, tmp_path):
     settings = get_settings()
     monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")

@@ -16,19 +16,25 @@ class GeminiError(RuntimeError):
 CANDIDATE_SCHEMA = {
     "type": "object",
     "properties": {
-        "shared_caption": {"type": "string"},
-        "hashtags": {"type": "array", "items": {"type": "string"}},
-        "tiktok_caption": {"type": "string"},
-        "instagram_caption": {"type": "string"},
-        "facebook_caption": {"type": "string"},
-        "youtube_title": {"type": "string"},
-        "youtube_description": {"type": "string"},
+        "shared_caption": {"type": "string", "maxLength": 2200},
+        "hashtags": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {"type": "string", "maxLength": 100},
+        },
+        "tiktok_caption": {"type": "string", "maxLength": 2200},
+        "instagram_caption": {"type": "string", "maxLength": 2200},
+        "facebook_title": {"type": "string", "maxLength": 255},
+        "facebook_caption": {"type": "string", "maxLength": 63206},
+        "youtube_title": {"type": "string", "maxLength": 100},
+        "youtube_description": {"type": "string", "maxLength": 5000},
     },
     "required": [
         "shared_caption",
         "hashtags",
         "tiktok_caption",
         "instagram_caption",
+        "facebook_title",
         "facebook_caption",
         "youtube_title",
         "youtube_description",
@@ -207,7 +213,11 @@ class GeminiClient:
             "Create accurate, engaging social copy for the attached creator video. Do not invent factual claims. "
             f"Selected platforms: {', '.join(platforms)}. Existing caption: {current_caption!r}. "
             f"Existing hashtags: {', '.join(hashtags)}. {context_instruction} "
-            "Keep each platform's conventions and return only the schema."
+            "Keep each platform's conventions. Every caption and description field must contain body text only: "
+            "do not embed hashtags in those fields. Put hashtags only in the hashtags array, without a leading # "
+            "and without spaces. Keep YouTube title within 100 characters, Facebook title within 255, TikTok and "
+            "Instagram captions within 2200, and YouTube description within 5000 UTF-8 bytes after hashtags are "
+            "appended. Use an empty string for an unselected platform. Return only the schema."
         )
         return await self._generate(
             [
@@ -230,6 +240,8 @@ class GeminiClient:
         )
         prompt = (
             f"Rewrite this social content with the adjustment '{adjustment}'. Preserve facts and return every field. "
+            "Keep hashtags only in the hashtags array without # characters or spaces; captions must contain body "
+            "text only. Preserve all platform limits. "
             f"{context_instruction} Candidate JSON: {json.dumps(candidate, ensure_ascii=False)}"
         )
         return await self._generate([{"text": prompt}])
