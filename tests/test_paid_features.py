@@ -6,15 +6,17 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
-from app.analytics import normalize_metrics
+from app.analytics import _merge_ai_explanations, normalize_metrics
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import (
     AIGenerationJob,
+    AnalyticsPeriodSnapshot,
     ComplimentaryGrant,
     MediaAsset,
     Post,
     Publication,
+    PublicationMetricSnapshot,
     SocialConnection,
     Subscription,
     User,
@@ -328,7 +330,13 @@ def test_platform_metrics_preserve_missing_values():
     normalized, metric, label = normalize_metrics(
         "instagram", {"reach": 1250, "likes": 42, "comments": 7}
     )
-    assert normalized == {"exposure": 1250, "likes": 42, "comments": 7, "shares": None}
+    assert normalized == {
+        "exposure": 1250,
+        "likes": 42,
+        "comments": 7,
+        "shares": None,
+        "saves": None,
+    }
     assert metric == "reach"
     assert label == "Accounts reached"
 
@@ -336,3 +344,120 @@ def test_platform_metrics_preserve_missing_values():
     assert missing["exposure"] is None
     assert metric is None
     assert label is None
+
+
+def test_overview_uses_provider_period_series_instead_of_publication_date(client):
+    email = "accurate-analytics@example.com"
+    _, headers = register(client, email)
+    asyncio.run(verify_user(email, grant="pro"))
+    post = create_draft(client, headers, "analytics-period")
+
+    async def seed_analytics() -> None:
+        async with SessionLocal() as db:
+            user = await db.scalar(select(User).where(User.email == email))
+            publication = Publication(
+                post_id=post["id"],
+                platform="instagram",
+                status="published",
+                provider_request_id="analytics-request",
+                published_at=datetime.now(UTC) - timedelta(days=3),
+            )
+            db.add(publication)
+            await db.flush()
+            db.add(
+                PublicationMetricSnapshot(
+                    publication_id=publication.id,
+                    raw_metrics={"post_metrics": {"reach": 450}},
+                    normalized_metrics={
+                        "exposure": 450,
+                        "likes": 20,
+                        "comments": 4,
+                        "shares": 2,
+                    },
+                    primary_metric="reach",
+                    primary_label="Accounts reached",
+                )
+            )
+            db.add(
+                AnalyticsPeriodSnapshot(
+                    user_id=user.id,
+                    period_days=30,
+                    start_date="2026-08-15",
+                    end_date="2026-09-13",
+                    raw_metrics={},
+                    normalized_metrics={
+                        "total_exposure": 1200,
+                        "previous_total_exposure": 1000,
+                        "change_percent": 20,
+                        "per_platform": {"instagram": 1200},
+                        "per_day": {"2026-09-10": 300, "2026-09-11": 900},
+                        "engagement": {"likes": 50, "comments": 9, "shares": 3},
+                        "connected_platforms": ["instagram"],
+                        "reporting_platforms": ["instagram"],
+                        "warnings": [],
+                    },
+                    provider_status="available",
+                )
+            )
+            await db.commit()
+
+    asyncio.run(seed_analytics())
+    response = client.get("/v1/analytics/overview?period=30d", headers=headers)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["total_exposure"] == 1200
+    assert data["change_percent"] == 20
+    assert data["trend"] == [
+        {"date": "2026-09-10", "exposure": 300.0},
+        {"date": "2026-09-11", "exposure": 900.0},
+    ]
+    assert data["engagement"]["comments"] == 9
+    assert data["coverage"] == {"connected": 1, "reporting": 1}
+    assert data["top_post"]["exposure"] == 450
+    assert data["insights_generated_by"] == "reverb"
+    assert data["insights"][0]["id"] == "momentum"
+    assert data["insights"][0]["metric_value"] == "+20.0%"
+    assert data["insights"][0]["confidence"] == "early_signal"
+
+
+def test_ai_insight_copy_cannot_change_server_owned_facts():
+    candidate = {
+        "id": "momentum",
+        "kind": "momentum",
+        "tone": "positive",
+        "headline": "Exposure is growing",
+        "explanation": "Exposure increased based on the verified comparison.",
+        "action": "Repeat one proven creative element.",
+        "confidence": "medium",
+        "metric_label": "Change vs prior period",
+        "metric_value": "+24.0%",
+        "supporting_post_ids": [],
+    }
+
+    merged = _merge_ai_explanations(
+        [candidate],
+        [
+            {
+                "candidate_id": "momentum",
+                "explanation": "Exposure supposedly increased by 99%.",
+                "action": "Publish 10 times tomorrow.",
+            }
+        ],
+    )
+
+    assert merged[0] == candidate
+
+
+def test_post_metrics_do_not_get_overwritten_by_profile_snapshots():
+    normalized, metric, _ = normalize_metrics(
+        "instagram",
+        {
+            "post_metrics": {"reach": 240, "likes": 18, "comments": 3},
+            "profile_snapshot_latest": {"reach": 80_000, "likes": 12_000},
+        },
+    )
+
+    assert metric == "reach"
+    assert normalized["exposure"] == 240
+    assert normalized["likes"] == 18

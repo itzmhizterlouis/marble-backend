@@ -186,3 +186,29 @@ async def test_post_analytics_uses_request_id_path(monkeypatch):
     assert route.called
     assert route.calls.last.request.url.params["platform"] == "instagram"
     assert "request_id" not in route.calls.last.request.url.params
+
+
+@respx.mock
+async def test_total_exposure_uses_exact_dates_platforms_and_metrics(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.get(
+        "https://provider.test/api/uploadposts/total-impressions/marble_creator"
+    ).mock(return_value=Response(200, json={"metrics": {"comments": 12}}))
+
+    result = await UploadPostClient().total_exposure(
+        "marble_creator",
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        metrics=["likes", "comments", "shares"],
+        platforms=["instagram", "youtube"],
+    )
+
+    params = route.calls.last.request.url.params
+    assert result["metrics"]["comments"] == 12
+    assert params["start_date"] == "2026-08-01"
+    assert params["end_date"] == "2026-08-31"
+    assert params["metrics"] == "likes,comments,shares"
+    assert params["platform"] == "instagram,youtube"
+    assert "period" not in params

@@ -35,6 +35,31 @@ CANDIDATE_SCHEMA = {
     ],
 }
 
+ANALYTICS_INSIGHTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "insights": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string"},
+                    "explanation": {"type": "string"},
+                    "action": {"type": "string"},
+                },
+                "required": [
+                    "candidate_id",
+                    "explanation",
+                    "action",
+                ],
+            },
+        }
+    },
+    "required": ["insights"],
+}
+
 
 class GeminiClient:
     def __init__(self) -> None:
@@ -98,7 +123,14 @@ class GeminiClient:
                 f"https://generativelanguage.googleapis.com/v1beta/{name}?key={self.settings.gemini_api_key}"
             )
 
-    async def _generate(self, parts: list[dict]) -> tuple[dict, dict]:
+    async def _generate_json(
+        self,
+        parts: list[dict],
+        schema: dict,
+        *,
+        temperature: float,
+        invalid_message: str,
+    ) -> tuple[dict, dict]:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.settings.gemini_model}:generateContent?key={self.settings.gemini_api_key}"
@@ -107,8 +139,8 @@ class GeminiClient:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseJsonSchema": CANDIDATE_SCHEMA,
-                "temperature": 0.7,
+                "responseJsonSchema": schema,
+                "temperature": temperature,
             },
         }
         async with httpx.AsyncClient(timeout=180) as client:
@@ -118,12 +150,43 @@ class GeminiClient:
         body = response.json()
         try:
             text = body["candidates"][0]["content"]["parts"][0]["text"]
-            candidate = json.loads(text)
+            result = json.loads(text)
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise GeminiError("AI returned an invalid draft") from exc
+            raise GeminiError(invalid_message) from exc
+        return result, body.get("usageMetadata") or {}
+
+    async def _generate(self, parts: list[dict]) -> tuple[dict, dict]:
+        candidate, usage = await self._generate_json(
+            parts,
+            CANDIDATE_SCHEMA,
+            temperature=0.7,
+            invalid_message="AI returned an invalid draft",
+        )
         if not all(key in candidate for key in CANDIDATE_SCHEMA["required"]):
             raise GeminiError("AI returned an incomplete draft")
-        return candidate, body.get("usageMetadata") or {}
+        return candidate, usage
+
+    async def create_analytics_insights(self, evidence: dict) -> tuple[list[dict], dict]:
+        prompt = (
+            "You are Reverb's pragmatic social-performance analyst. Create 3 to 5 concise insight cards "
+            "using only the supplied evidence. Reverb has already calculated every number: never calculate, "
+            "estimate, invent, or imply causation. Prefer a specific next action over generic advice. Treat "
+            "cross-platform exposure metrics as directional, not identical. Preserve the supplied confidence "
+            "level. Select only supplied candidate IDs and do not repeat numbers in explanation or action; the "
+            "interface renders Reverb's verified metric separately. If evidence is limited, say it is an early "
+            "signal. Return only the requested schema. Evidence JSON: "
+            f"{json.dumps(evidence, ensure_ascii=False, separators=(',', ':'))}"
+        )
+        result, usage = await self._generate_json(
+            [{"text": prompt}],
+            ANALYTICS_INSIGHTS_SCHEMA,
+            temperature=0.25,
+            invalid_message="AI returned invalid analytics insights",
+        )
+        insights = result.get("insights")
+        if not isinstance(insights, list) or not insights:
+            raise GeminiError("AI returned incomplete analytics insights")
+        return insights[:5], usage
 
     async def create_candidate(
         self,

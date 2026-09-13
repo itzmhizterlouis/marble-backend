@@ -383,6 +383,23 @@ class PublicationMetricSnapshot(Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class AnalyticsPeriodSnapshot(Base):
+    """A provider-calculated date-window snapshot used by the Insights overview."""
+
+    __tablename__ = "analytics_period_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    period_days: Mapped[int] = mapped_column(Integer, index=True)
+    start_date: Mapped[str] = mapped_column(String(10))
+    end_date: Mapped[str] = mapped_column(String(10))
+    raw_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    normalized_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    provider_status: Mapped[str] = mapped_column(String(24), default="available")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class GeneratedInsight(Base, TimestampMixin):
     __tablename__ = "generated_insights"
     __table_args__ = (UniqueConstraint("user_id", "period_days", name="uq_insight_user_period"),)

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from celery import Celery
+from celery.exceptions import CeleryError
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -912,6 +913,12 @@ async def _sync_analytics(user_id: str, force: bool = False) -> None:
             return
         await sync_user_analytics(db, user, force=force)
         await publish_realtime_event(user.id, "analytics.updated")
+        # AI explanations run as a separate job so a slow model response never
+        # delays the real-metrics update reaching the dashboard.
+        try:
+            generate_analytics_insights.delay(user.id)
+        except CeleryError:
+            logger.warning("Could not queue AI analytics insights for user %s", user.id)
 
 
 @celery_app.task(
@@ -924,9 +931,55 @@ def sync_analytics(user_id: str, force: bool = False) -> None:
     asyncio.run(_sync_analytics(user_id, force))
 
 
+async def _generate_analytics_insights(user_id: str) -> None:
+    from .analytics import analytics_overview
+    from .entitlements import resolve_billing_access
+    from .models import FeatureFlag
+
+    async with TaskSessionLocal() as db:
+        user = await db.get(User, user_id)
+        if not user:
+            return
+        access = await resolve_billing_access(db, user)
+        ai_flag = await db.get(FeatureFlag, "ai")
+        settings = get_settings()
+        if (
+            not access.capabilities["analytics"]
+            or not settings.ai_enabled
+            or not settings.gemini_api_key
+            or (ai_flag and not ai_flag.enabled)
+        ):
+            return
+        for period_days in (7, 30, 90):
+            try:
+                await analytics_overview(db, user, period_days, generate_ai=True)
+            except Exception:
+                logger.warning(
+                    "Could not generate %s-day insights for user %s",
+                    period_days,
+                    user.id,
+                    exc_info=True,
+                )
+        await publish_realtime_event(user.id, "analytics.updated")
+
+
+@celery_app.task(
+    name="marble.generate_analytics_insights",
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    max_retries=3,
+)
+def generate_analytics_insights(user_id: str) -> None:
+    asyncio.run(_generate_analytics_insights(user_id))
+
+
 async def _sync_due_analytics() -> None:
     from .entitlements import resolve_billing_access
-    from .models import AccountAnalyticsSnapshot, PublicationMetricSnapshot
+    from .models import (
+        AccountAnalyticsSnapshot,
+        AnalyticsPeriodSnapshot,
+        PublicationMetricSnapshot,
+    )
 
     async with TaskSessionLocal() as db:
         users = list(await db.scalars(select(User).where(User.email_verified.is_(True))))
@@ -942,7 +995,18 @@ async def _sync_due_analytics() -> None:
                 select(PublicationMetricSnapshot).where(PublicationMetricSnapshot.captured_at < retention_cutoff)
             )
         )
-        for snapshot in [*old_account_snapshots, *old_publication_snapshots]:
+        old_period_snapshots = list(
+            await db.scalars(
+                select(AnalyticsPeriodSnapshot).where(
+                    AnalyticsPeriodSnapshot.captured_at < retention_cutoff
+                )
+            )
+        )
+        for snapshot in [
+            *old_account_snapshots,
+            *old_publication_snapshots,
+            *old_period_snapshots,
+        ]:
             await db.delete(snapshot)
         await db.commit()
     for user_id in eligible:

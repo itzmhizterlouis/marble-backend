@@ -245,16 +245,25 @@ class UploadPostClient:
         self,
         profile: str,
         *,
-        period: str = "last_month",
+        period: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        metrics: list[str] | None = None,
         platforms: list[str] | None = None,
         breakdown: bool = True,
     ) -> dict:
-        params = {
-            "period": period,
-            "breakdown": str(breakdown).lower(),
-        }
+        params: dict[str, str] = {"breakdown": str(breakdown).lower()}
+        if start_date and end_date:
+            params["start_date"] = start_date
+            params["end_date"] = end_date
+        elif period:
+            params["period"] = period
+        else:
+            params["period"] = "last_month"
         if platforms:
             params["platform"] = ",".join(platforms)
+        if metrics:
+            params["metrics"] = ",".join(metrics)
         return await self._json("GET", f"/uploadposts/total-impressions/{profile}", params=params)
 
     async def post_analytics(
