@@ -65,6 +65,10 @@ async def publish_media_event(user_id: str, media_id: str) -> None:
     await publish_realtime_event(user_id, "media.updated", media_id=media_id)
 
 
+async def publish_connection_event(user_id: str, platform: str) -> None:
+    await publish_realtime_event(user_id, "connection.updated", platform=platform)
+
+
 async def authenticated_user_id(credentials: HTTPAuthorizationCredentials | None) -> str:
     if not credentials:
         raise HTTPException(

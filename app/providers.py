@@ -5,7 +5,6 @@ import hmac
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -88,22 +87,8 @@ class UploadPostClient:
         return access_url
 
     async def connection_url(self, username: str, platform: str, redirect_url: str) -> str:
-        access_url = await self.connection_access_url(username, platform, redirect_url)
-        token = parse_qs(urlparse(access_url).query).get("token", [None])[0]
-        if not token:
-            return access_url
-        try:
-            async with httpx.AsyncClient(base_url=self.settings.upload_post_base_url, timeout=40) as client:
-                response = await client.post(
-                    f"/uploadposts/oauth/{platform}/start",
-                    headers={"Authorization": f"Bearer {token}"},
-                    json={"redirect_url": redirect_url},
-                )
-        except httpx.HTTPError as exc:
-            raise ProviderError("provider_unavailable", "Upload-Post is temporarily unavailable", 503) from exc
-        if response.is_success and response.json().get("authorize_url"):
-            return response.json()["authorize_url"]
-        return access_url
+        """Return Upload-Post's hosted connection URL without bypassing its mobile OAuth bounce."""
+        return await self.connection_access_url(username, platform, redirect_url)
 
     async def facebook_pages(self, username: str) -> list[dict]:
         body = await self._json("GET", "/uploadposts/facebook/pages", params={"profile": username})

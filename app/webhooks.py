@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .database import get_db
-from .events import publish_post_event
+from .events import publish_connection_event, publish_post_event
 from .models import Post, Publication, PublicationAttempt, SocialConnection, User, WebhookEvent
 from .notifications import queue_terminal_notification
 from .providers import verify_upload_post_signature
@@ -52,6 +52,7 @@ async def upload_post_webhook(
     event_name = str(payload.get("event") or "")
     profile_username = payload.get("profile_username")
     platform = payload.get("platform")
+    connection_updated = False
     if event_name in {
         "social_account_connected",
         "social_account_disconnected",
@@ -90,6 +91,7 @@ async def upload_post_webhook(
                 if identifier:
                     connection.provider_account_id = identifier
                     connection.username = identifier
+            connection_updated = True
     external_id = str(payload.get("external_id") or "").split(":")[0]
     request_id = payload.get("request_id")
     job_id = payload.get("job_id")
@@ -126,6 +128,8 @@ async def upload_post_webhook(
         await queue_terminal_notification(db, post)
     event.processed_at = datetime.now(UTC)
     await db.commit()
+    if connection_updated:
+        await publish_connection_event(user.id, str(platform))
     if post:
         await publish_post_event(post.user_id, post.id)
     return MessageOut(message="Processed")

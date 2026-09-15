@@ -95,6 +95,28 @@ def test_connection_metadata_and_management_handoff(client, monkeypatch):
     assert manage.json()["authorize_url"].startswith("https://app.upload-post.com/connect")
 
 
+def test_connection_authorize_keeps_upload_post_hosted_access_url(client, monkeypatch):
+    email = "connection-mobile@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=()))
+
+    async def connection_manager(_self, username, platform, redirect_url):
+        assert username.startswith("marble_")
+        assert platform == "tiktok"
+        assert redirect_url.endswith("/accounts?connect_platform=tiktok")
+        return "https://app.upload-post.com/connect?token=mobile-safe-token"
+
+    async def profile(_self, _username):
+        return {"profile": {"social_accounts": {}}}
+
+    monkeypatch.setattr(UploadPostClient, "get_profile", profile)
+    monkeypatch.setattr(UploadPostClient, "connection_access_url", connection_manager)
+    response = client.post("/v1/connections/tiktok/authorize", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"authorize_url": "https://app.upload-post.com/connect?token=mobile-safe-token"}
+
+
 def test_connection_sync_exposes_public_handles_and_preserves_provider_ids(client, monkeypatch):
     email = "connection-handle@example.com"
     auth = register(client, email)
@@ -164,15 +186,22 @@ def test_connection_webhook_does_not_replace_public_handle_with_provider_id(clie
             connection.handle = "marvellousoshorenoya1175"
             connection.display_name = "Marvellous Oshorenoya"
             await db.commit()
+            return user.upload_post_profile
 
-    asyncio.run(seed_connection())
+    profile_username = asyncio.run(seed_connection())
     secret = "webhook-handle-secret"
     monkeypatch.setattr(get_settings(), "upload_post_webhook_secret", secret)
+    connection_events = []
+
+    async def capture_connection_event(user_id, platform):
+        connection_events.append((user_id, platform))
+
+    monkeypatch.setattr("app.webhooks.publish_connection_event", capture_connection_event)
     payload = json.dumps(
         {
             "event": "social_account_connected",
             "event_id": "connection-handle-webhook-1",
-            "profile_username": "marble_connection-webhook-handle",
+            "profile_username": profile_username,
             "platform": "youtube",
             "account_name": "UC2wycYDhEg2a__i-o123456",
         }
@@ -192,6 +221,7 @@ def test_connection_webhook_does_not_replace_public_handle_with_provider_id(clie
         },
     )
     assert delivered.status_code == 200, delivered.text
+    assert connection_events and connection_events[0][1] == "youtube"
 
     connections = client.get("/v1/connections", headers=headers)
     youtube = next(item for item in connections.json() if item["platform"] == "youtube")
