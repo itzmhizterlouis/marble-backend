@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -62,7 +63,14 @@ async def sync_connections(db: AsyncSession, user: User) -> list[SocialConnectio
     rows = await ensure_rows(db, user)
     client = UploadPostClient()
     try:
-        payload = await client.get_profile(user.upload_post_profile)
+        async with asyncio.timeout(10):
+            payload = await client.get_profile(user.upload_post_profile)
+    except TimeoutError as exc:
+        raise ProviderError(
+            "provider_timeout",
+            "Upload-Post took too long to confirm the account. Try synchronizing again.",
+            504,
+        ) from exc
     except ProviderError as exc:
         if exc.status_code == 404:
             await client.create_profile(user.upload_post_profile)
@@ -116,8 +124,9 @@ async def sync_connections(db: AsyncSession, user: User) -> list[SocialConnectio
     facebook = next((item for item in rows if item.platform == "facebook"), None)
     if facebook and facebook.status == "connected":
         try:
-            pages = await client.facebook_pages(user.upload_post_profile)
-        except ProviderError:
+            async with asyncio.timeout(10):
+                pages = await client.facebook_pages(user.upload_post_profile)
+        except (ProviderError, TimeoutError):
             pages = []
         if len(pages) == 1 and not facebook.target_page_id:
             facebook.target_page_id = str(pages[0].get("page_id") or pages[0].get("id"))
