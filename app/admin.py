@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
@@ -16,6 +16,7 @@ from .models import (
     ComplimentaryGrant,
     EntitlementAuditEvent,
     FeatureFlag,
+    Post,
     Subscription,
     TrialUsage,
     User,
@@ -53,22 +54,29 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ):
     del admin
-    query = select(User).order_by(User.created_at.desc()).limit(100)
+    query = (
+        select(User, func.count(Post.id).label("post_count"))
+        .outerjoin(Post, Post.user_id == User.id)
+        .group_by(User.id)
+        .order_by(User.created_at.desc())
+        .limit(100)
+    )
     if q.strip():
         search = f"%{q.strip()}%"
         query = query.where(or_(User.email.ilike(search), User.name.ilike(search)))
-    users = list(await db.scalars(query))
+    users = (await db.execute(query)).all()
     return {
         "items": [
             {
-                "id": item.id,
-                "name": item.name,
-                "email": item.email,
-                "email_verified": item.email_verified,
-                "created_at": item.created_at,
-                "billing": (await resolve_billing_access(db, item)).payload(),
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "email_verified": user.email_verified,
+                "created_at": user.created_at,
+                "post_count": post_count,
+                "billing": (await resolve_billing_access(db, user)).payload(),
             }
-            for item in users
+            for user, post_count in users
         ]
     }
 

@@ -91,6 +91,25 @@ def create_draft(client, headers: dict[str, str], suffix: str) -> dict:
     return post.json()
 
 
+def test_admin_users_include_the_number_of_posts_created(client, monkeypatch):
+    settings = get_settings()
+    admin_email = "reverb-admin@example.com"
+    creator_email = "posts-created@example.com"
+    monkeypatch.setattr(settings, "admin_emails", admin_email)
+    _, admin_headers = register(client, admin_email)
+    _, creator_headers = register(client, creator_email)
+    asyncio.run(verify_user(creator_email))
+    create_draft(client, creator_headers, "first-admin-post")
+    create_draft(client, creator_headers, "second-admin-post")
+
+    response = client.get("/v1/admin/users", headers=admin_headers)
+
+    assert response.status_code == 200, response.text
+    users = {item["email"]: item for item in response.json()["items"]}
+    assert users[creator_email]["post_count"] == 2
+    assert users[admin_email]["post_count"] == 0
+
+
 def test_one_post_preview_is_atomic_and_allows_same_post_retry(client, monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "billing_enforcement_enabled", True)
