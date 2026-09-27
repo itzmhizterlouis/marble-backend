@@ -66,13 +66,14 @@ def decode_media_token(token: str) -> str:
     return str(payload["sub"])
 
 
-def create_oauth_state(nonce: str) -> str:
+def create_oauth_state(nonce: str, referral_code: str | None = None) -> str:
     settings = get_settings()
     now = datetime.now(UTC)
     return jwt.encode(
         {
             "type": "google_oauth",
             "nonce": nonce,
+            "referral_code": referral_code,
             "iat": now,
             "exp": now + timedelta(minutes=10),
         },
@@ -82,6 +83,10 @@ def create_oauth_state(nonce: str) -> str:
 
 
 def verify_oauth_state(state: str) -> str:
+    return str(decode_oauth_state(state)["nonce"])
+
+
+def decode_oauth_state(state: str) -> dict:
     settings = get_settings()
     payload = jwt.decode(state, settings.jwt_secret, algorithms=["HS256"])
     if payload.get("type") != "google_oauth":
@@ -89,7 +94,7 @@ def verify_oauth_state(state: str) -> str:
     nonce = payload.get("nonce")
     if not nonce:
         raise jwt.InvalidTokenError("Invalid OAuth state")
-    return str(nonce)
+    return payload
 
 
 def new_opaque_token() -> str:

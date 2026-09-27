@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from .admin import router as admin_router
+from .affiliate import router as affiliate_router
 from .ai import router as ai_router
 from .analytics import router as analytics_router
 from .auth import router as auth_router
@@ -102,6 +103,7 @@ async def unexpected_exception_handler(request: Request, exc: Exception):
 
 app.include_router(auth_router)
 app.include_router(billing_router)
+app.include_router(affiliate_router)
 app.include_router(analytics_router)
 app.include_router(ai_router)
 app.include_router(admin_router)

@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     paystack_callback_url: str = "http://localhost:4173/billing/callback"
     admin_emails: str = ""
     billing_enforcement_enabled: bool = False
+    affiliate_enabled: bool = False
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     ai_enabled: bool = True

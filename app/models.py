@@ -43,6 +43,9 @@ class User(Base, TimestampMixin):
     google_sub: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     upload_post_profile: Mapped[str] = mapped_column(String(80), unique=True)
+    referral_code: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True, index=True)
+    referred_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    first_paid_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     sessions: Mapped[list[AuthSession]] = relationship(back_populates="user", cascade="all, delete-orphan")
     connections: Mapped[list[SocialConnection]] = relationship(
@@ -303,6 +306,89 @@ class BillingEvent(Base):
     event_type: Mapped[str] = mapped_column(String(80), index=True)
     payload: Mapped[dict] = mapped_column(JSON)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AffiliateCommission(Base, TimestampMixin):
+    __tablename__ = "affiliate_commissions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    referrer_user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    referred_user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), unique=True, index=True)
+    payment_reference: Mapped[str] = mapped_column(String(255), unique=True)
+    subscription_id: Mapped[str | None] = mapped_column(ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True)
+    payment_amount_kobo: Mapped[int] = mapped_column(BigInteger)
+    amount_kobo: Mapped[int] = mapped_column(BigInteger)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reversal_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    requires_review: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class AffiliatePaymentReversal(Base):
+    __tablename__ = "affiliate_payment_reversals"
+
+    payment_reference: Mapped[str] = mapped_column(String(255), primary_key=True)
+    reason: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AffiliateLedgerEntry(Base):
+    __tablename__ = "affiliate_ledger_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    commission_id: Mapped[str | None] = mapped_column(ForeignKey("affiliate_commissions.id", ondelete="RESTRICT"), nullable=True)
+    payout_id: Mapped[str | None] = mapped_column(ForeignKey("affiliate_payouts.id", ondelete="RESTRICT"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(24))
+    amount_kobo: Mapped[int] = mapped_column(BigInteger)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AffiliateBankRecipient(Base, TimestampMixin):
+    __tablename__ = "affiliate_bank_recipients"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    recipient_code: Mapped[str] = mapped_column(String(255))
+    bank_code: Mapped[str] = mapped_column(String(32))
+    bank_name: Mapped[str] = mapped_column(String(255))
+    account_name: Mapped[str] = mapped_column(String(255))
+    account_last_four: Mapped[str] = mapped_column(String(4))
+
+
+class AffiliatePayout(Base, TimestampMixin):
+    __tablename__ = "affiliate_payouts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    recipient_code: Mapped[str] = mapped_column(String(255))
+    bank_name: Mapped[str] = mapped_column(String(255))
+    account_name: Mapped[str] = mapped_column(String(255))
+    account_last_four: Mapped[str] = mapped_column(String(4))
+    requested_kobo: Mapped[int] = mapped_column(BigInteger)
+    fee_kobo: Mapped[int] = mapped_column(BigInteger)
+    net_kobo: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(32), default="requested", index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255))
+    transfer_reference: Mapped[str] = mapped_column(String(50), unique=True)
+    transfer_code: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approved_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "idempotency_key", name="uq_affiliate_payout_user_key"),)
+
+
+class AffiliateAuditEvent(Base):
+    __tablename__ = "affiliate_audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    actor_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    payout_id: Mapped[str | None] = mapped_column(ForeignKey("affiliate_payouts.id", ondelete="RESTRICT"), nullable=True)
+    action: Mapped[str] = mapped_column(String(80))
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

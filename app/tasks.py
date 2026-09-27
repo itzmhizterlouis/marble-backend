@@ -60,6 +60,7 @@ celery_app.conf.update(
             "schedule": 30.0,
         },
         "process-billing-events": {"task": "marble.process_pending_billing_events", "schedule": 30.0},
+        "reconcile-affiliate-payouts": {"task": "marble.reconcile_affiliate_payouts", "schedule": 300.0},
         "sync-due-analytics": {"task": "marble.sync_due_analytics", "schedule": 86400.0},
         "enforce-expired-access": {"task": "marble.enforce_expired_access", "schedule": 3600.0},
     },
@@ -920,12 +921,44 @@ async def _process_pending_billing_events() -> None:
             )
         )
         for event in events:
-            await apply_billing_event(db, event)
+            try:
+                await apply_billing_event(db, event)
+            except Exception:
+                await db.rollback()
+                logger.exception("Could not process billing event %s", event.id)
 
 
 @celery_app.task(name="marble.process_pending_billing_events")
 def process_pending_billing_events() -> None:
     asyncio.run(_process_pending_billing_events())
+
+
+async def _reconcile_affiliate_payouts() -> None:
+    from .affiliate import _update_transfer_response
+    from .models import AffiliatePayout
+    from .paystack import PaystackClient, PaystackError
+
+    async with TaskSessionLocal() as db:
+        candidates = (await db.scalars(select(AffiliatePayout).where(AffiliatePayout.status.in_(["pending", "uncertain"])).order_by(AffiliatePayout.created_at).limit(100))).all()
+        references = [(item.id, item.transfer_reference) for item in candidates]
+    client = PaystackClient()
+    for payout_id, reference in references:
+        try:
+            result = await client.verify_transfer(reference)
+        except PaystackError:
+            continue
+        async with TaskSessionLocal() as db:
+            payout = await db.scalar(select(AffiliatePayout).where(AffiliatePayout.id == payout_id).with_for_update())
+            if not payout or payout.status not in {"pending", "uncertain"}:
+                continue
+            await _update_transfer_response(db, payout, result)
+            await db.commit()
+            await publish_realtime_event(payout.user_id, "referrals.updated")
+
+
+@celery_app.task(name="marble.reconcile_affiliate_payouts")
+def reconcile_affiliate_payouts() -> None:
+    asyncio.run(_reconcile_affiliate_payouts())
 
 
 async def _sync_analytics(user_id: str, force: bool = False) -> None:

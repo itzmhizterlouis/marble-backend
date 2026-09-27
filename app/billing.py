@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .affiliate import apply_transfer_event, record_first_payment, reverse_commission
 from .config import get_settings
 from .database import get_db
 from .deps import get_current_user, require_verified_user
@@ -79,8 +80,16 @@ async def activate_transaction(db: AsyncSession, user: User, data: dict, request
         raise HTTPException(status_code=403, detail={"code": "payment_owner_mismatch", "message": "This payment belongs to another account"})
     if customer.get("email") and str(customer["email"]).casefold() != user.email.casefold():
         raise HTTPException(status_code=403, detail={"code": "payment_owner_mismatch", "message": "This payment belongs to another account"})
+    if not metadata_user and not customer.get("email"):
+        raise HTTPException(status_code=403, detail={"code": "payment_owner_unconfirmed", "message": "Paystack did not confirm the payment owner"})
     existing = await db.scalar(select(Subscription).where(Subscription.reference == reference))
     if existing:
+        if existing.user_id != user.id:
+            raise HTTPException(status_code=403, detail={"code": "payment_owner_mismatch", "message": "This payment belongs to another account"})
+        commission = await record_first_payment(db, user, reference, int(data["amount"]), existing.id, _parse_time(data.get("paid_at") or data.get("paidAt")))
+        await db.commit()
+        if commission:
+            await publish_realtime_event(commission.referrer_user_id, "referrals.updated")
         return existing
     now = utcnow()
     subscription_data = data.get("subscription") if isinstance(data.get("subscription"), dict) else {}
@@ -102,11 +111,15 @@ async def activate_transaction(db: AsyncSession, user: User, data: dict, request
         .where(Subscription.user_id == user.id, Subscription.status.in_(["active", "grace"]))
         .order_by(Subscription.created_at.desc())
     )
-    db.add(subscription)
     if previous:
         previous.status = "replaced"
         previous.cancel_at_period_end = True
+    db.add(subscription)
+    await db.flush()
+    commission = await record_first_payment(db, user, reference, PLAN_AMOUNTS[plan], subscription.id, _parse_time(data.get("paid_at") or data.get("paidAt")))
     await db.commit()
+    if commission:
+        await publish_realtime_event(commission.referrer_user_id, "referrals.updated")
     await publish_realtime_event(user.id, "billing.updated")
     if plan == "pro":
         try:
@@ -227,6 +240,27 @@ async def apply_billing_event(db: AsyncSession, event: BillingEvent) -> None:
     payload = event.payload or {}
     name = str(payload.get("event") or event.event_type)
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if name in {"refund.processed", "charge.dispute.create"}:
+        transaction = data.get("transaction") if isinstance(data.get("transaction"), dict) else {}
+        reference = str(data.get("transaction_reference") or data.get("reference") or transaction.get("reference") or "")
+        transaction_id = transaction.get("id") or (data.get("transaction") if isinstance(data.get("transaction"), int) else None)
+        if not reference and transaction_id:
+            reference = str((await PaystackClient().fetch_transaction(int(transaction_id))).get("reference") or "")
+        if not reference:
+            raise ValueError("Paystack reversal event has no transaction reference")
+        referrer_id = await reverse_commission(db, reference, name)
+        event.processed_at = utcnow()
+        await db.commit()
+        if referrer_id:
+            await publish_realtime_event(referrer_id, "referrals.updated")
+        return
+    if name in {"transfer.success", "transfer.failed", "transfer.reversed"}:
+        creator_id = await apply_transfer_event(db, data, name)
+        event.processed_at = utcnow()
+        await db.commit()
+        if creator_id:
+            await publish_realtime_event(creator_id, "referrals.updated")
+        return
     customer = data.get("customer") if isinstance(data.get("customer"), dict) else {}
     email = str(customer.get("email") or data.get("email") or "").casefold()
     user = await db.scalar(select(User).where(User.email == email)) if email else None
@@ -329,8 +363,17 @@ async def apply_billing_event(db: AsyncSession, event: BillingEvent) -> None:
         elif name in {"subscription.disable", "subscription.not_renew"}:
             subscription.cancel_at_period_end = True
             subscription.cancelled_at = utcnow()
+    commission = None
+    if name == "charge.success" and user and reference and subscription and subscription.plan in PLAN_AMOUNTS:
+        if int(data.get("amount") or 0) == PLAN_AMOUNTS[subscription.plan] and str(data.get("currency") or "NGN").upper() == "NGN":
+            metadata_user = str(metadata.get("reverb_user_id") or "")
+            if not metadata_user or metadata_user == user.id:
+                await db.flush()
+                commission = await record_first_payment(db, user, reference, int(data["amount"]), subscription.id, _parse_time(data.get("paid_at") or data.get("paidAt")))
     event.processed_at = utcnow()
     await db.commit()
+    if commission:
+        await publish_realtime_event(commission.referrer_user_id, "referrals.updated")
     if subscription:
         await publish_realtime_event(subscription.user_id, "billing.updated")
         if subscription.status == "active" and subscription.plan == "pro":

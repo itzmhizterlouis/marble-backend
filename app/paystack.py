@@ -49,6 +49,9 @@ class PaystackClient:
     async def verify_transaction(self, reference: str) -> dict:
         return await self._request("GET", f"/transaction/verify/{reference}")
 
+    async def fetch_transaction(self, transaction_id: int) -> dict:
+        return await self._request("GET", f"/transaction/{transaction_id}")
+
     async def disable_subscription(self, subscription_code: str, email_token: str) -> dict:
         return await self._request(
             "POST", "/subscription/disable", json={"code": subscription_code, "token": email_token}
@@ -56,3 +59,21 @@ class PaystackClient:
 
     async def manage_link(self, subscription_code: str) -> dict:
         return await self._request("GET", f"/subscription/{subscription_code}/manage/link")
+
+    async def banks(self) -> list[dict]:
+        return await self._request("GET", "/bank", params={"currency": "NGN", "perPage": 200})
+
+    async def resolve_account(self, bank_code: str, account_number: str) -> dict:
+        return await self._request("GET", "/bank/resolve", params={"bank_code": bank_code, "account_number": account_number})
+
+    async def create_transfer_recipient(self, name: str, bank_code: str, account_number: str) -> dict:
+        return await self._request("POST", "/transferrecipient", json={"type": "nuban", "name": name, "bank_code": bank_code, "account_number": account_number, "currency": "NGN"})
+
+    async def initiate_transfer(self, reference: str, recipient: str, amount_kobo: int) -> dict:
+        return await self._request("POST", "/transfer", json={"source": "balance", "amount": amount_kobo, "recipient": recipient, "reference": reference, "reason": "Reverb creator referral earnings", "currency": "NGN"})
+
+    async def verify_transfer(self, reference: str) -> dict:
+        return await self._request("GET", f"/transfer/verify/{reference}")
+
+    async def finalize_transfer(self, transfer_code: str, otp: str) -> dict:
+        return await self._request("POST", "/transfer/finalize_transfer", json={"transfer_code": transfer_code, "otp": otp})

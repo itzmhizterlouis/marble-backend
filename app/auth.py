@@ -11,6 +11,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .affiliate import new_referral_code, resolve_referrer
 from .config import get_settings
 from .database import get_db
 from .deps import get_current_user
@@ -20,11 +21,11 @@ from .schemas import AuthResponse, EmailIn, LoginIn, MessageOut, PasswordResetIn
 from .security import (
     create_access_token,
     create_oauth_state,
+    decode_oauth_state,
     hash_password,
     new_opaque_token,
     refresh_expiry,
     token_hash,
-    verify_oauth_state,
     verify_password,
 )
 
@@ -120,11 +121,16 @@ async def register(
         raise HTTPException(
             status_code=409, detail={"code": "email_taken", "message": "An account already uses this email"}
         )
+    referrer = await resolve_referrer(db, payload.referral_code)
+    if referrer and referrer.email == email:
+        raise HTTPException(status_code=400, detail={"code": "self_referral", "message": "You cannot use your own referral code"})
     user = User(
         email=email,
         name=payload.name.strip(),
         password_hash=hash_password(payload.password),
         upload_post_profile=f"marble_{new_opaque_token()[:20].lower()}",
+        referral_code=new_referral_code(),
+        referred_by_user_id=referrer.id if referrer else None,
     )
     db.add(user)
     await db.flush()
@@ -239,12 +245,13 @@ async def reset_password(payload: PasswordResetIn, db: AsyncSession = Depends(ge
 
 
 @router.get("/google/start")
-async def google_start(response: Response):
-    authorize_url = prepare_google_authorization(response)
+async def google_start(response: Response, ref: str | None = None, db: AsyncSession = Depends(get_db)):
+    referrer = await resolve_referrer(db, ref)
+    authorize_url = prepare_google_authorization(response, referrer.referral_code if referrer else None)
     return {"authorize_url": authorize_url}
 
 
-def prepare_google_authorization(response: Response) -> str:
+def prepare_google_authorization(response: Response, referral_code: str | None = None) -> str:
     settings = get_settings()
     if not settings.google_client_id:
         raise HTTPException(
@@ -260,7 +267,7 @@ def prepare_google_authorization(response: Response) -> str:
             "scope": "openid email profile",
             "access_type": "offline",
             "prompt": "select_account",
-            "state": create_oauth_state(nonce),
+            "state": create_oauth_state(nonce, referral_code),
         }
     )
     response.set_cookie(
@@ -276,10 +283,11 @@ def prepare_google_authorization(response: Response) -> str:
 
 
 @router.get("/google/authorize")
-async def google_authorize():
+async def google_authorize(ref: str | None = None, db: AsyncSession = Depends(get_db)):
     """Start OAuth as a top-level backend navigation so its state cookie stays first-party."""
     response = RedirectResponse(url="https://accounts.google.com", status_code=302)
-    response.headers["location"] = prepare_google_authorization(response)
+    referrer = await resolve_referrer(db, ref)
+    response.headers["location"] = prepare_google_authorization(response, referrer.referral_code if referrer else None)
     return response
 
 
@@ -292,7 +300,8 @@ async def google_callback(
 ):
     settings = get_settings()
     try:
-        state_nonce = verify_oauth_state(state)
+        state_payload = decode_oauth_state(state)
+        state_nonce = str(state_payload["nonce"])
         if not state_cookie or not secrets.compare_digest(state_nonce, state_cookie):
             raise jwt.InvalidTokenError("OAuth state does not match this browser")
     except jwt.InvalidTokenError as exc:
@@ -321,15 +330,22 @@ async def google_callback(
     email = normalize_email(profile["email"])
     user = await db.scalar(select(User).where((User.google_sub == profile["sub"]) | (User.email == email)))
     if not user:
+        referrer = await resolve_referrer(db, state_payload.get("referral_code"))
+        if referrer and referrer.email == email:
+            raise HTTPException(status_code=400, detail={"code": "self_referral", "message": "You cannot use your own referral code"})
         user = User(
             email=email,
             name=profile.get("name") or email.split("@")[0],
             google_sub=profile["sub"],
             email_verified=bool(profile.get("email_verified", True)),
             upload_post_profile=f"marble_{new_opaque_token()[:20].lower()}",
+            referral_code=new_referral_code(),
+            referred_by_user_id=referrer.id if referrer else None,
         )
         db.add(user)
     else:
+        if state_payload.get("referral_code"):
+            raise HTTPException(status_code=409, detail={"code": "referral_signup_only", "message": "Referral codes can only be used when creating a new account"})
         user.google_sub = profile["sub"]
         user.email_verified = user.email_verified or bool(profile.get("email_verified"))
     await db.commit()
