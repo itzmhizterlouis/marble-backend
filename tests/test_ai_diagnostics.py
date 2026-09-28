@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from app.config import get_settings
-from app.gemini import GeminiClient, GeminiError, VIDEO_GENERATION_SCHEMA
+from app.gemini import VIDEO_GENERATION_SCHEMA, GeminiClient, GeminiError
 from app.storage import StorageError
 from app.tasks import ai_failure_details
 
