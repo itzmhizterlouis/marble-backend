@@ -533,6 +533,9 @@ class AIGenerationJob(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
     model: Mapped[str] = mapped_column(String(80))
     candidate: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Grounded notes from the first video pass. Text-only variants inherit
+    # these notes so the same media does not need to be sent to Gemini again.
+    video_observations: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

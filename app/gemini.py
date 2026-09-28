@@ -69,6 +69,47 @@ CANDIDATE_SCHEMA = {
     ],
 }
 
+VIDEO_OBSERVATIONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string", "maxLength": 600},
+        "details": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "string", "maxLength": 220},
+        },
+        "uncertainties": {
+            "type": "array",
+            "maxItems": 3,
+            "items": {"type": "string", "maxLength": 220},
+        },
+    },
+    "required": ["summary", "details", "uncertainties"],
+}
+
+VIDEO_GENERATION_SCHEMA = {
+    "type": "object",
+    "properties": {**CANDIDATE_SCHEMA["properties"], "video_observations": VIDEO_OBSERVATIONS_SCHEMA},
+    "required": [*CANDIDATE_SCHEMA["required"], "video_observations"],
+}
+
+
+def validate_video_observations(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise GeminiError("AI did not describe what it observed in the video")
+    summary = value.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 600:
+        raise GeminiError("AI did not describe what it observed in the video")
+    result = {"summary": summary.strip()}
+    for name, limit in (("details", 6), ("uncertainties", 3)):
+        items = value.get(name)
+        if not isinstance(items, list) or len(items) > limit:
+            raise GeminiError("AI returned invalid video observations")
+        if any(not isinstance(item, str) or len(item) > 220 for item in items):
+            raise GeminiError("AI returned invalid video observations")
+        result[name] = [item.strip() for item in items if item.strip()]
+    return result
+
 ANALYTICS_INSIGHTS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -260,7 +301,7 @@ class GeminiClient:
         hashtags: list[str],
         platforms: list[str],
         generation_context: str = "",
-    ) -> tuple[dict, dict]:
+    ) -> tuple[dict, dict | None, dict]:
         context_instruction = (
             f"Creator-provided additional context (use as guidance, preserve the facts, and do not invent details): "
             f"{generation_context!r}."
@@ -268,7 +309,10 @@ class GeminiClient:
             else "No additional creator context was provided."
         )
         prompt = (
-            "Create accurate, engaging social copy for the attached creator video. Do not invent factual claims. "
+            "First describe only what is directly visible or audible in this creator video. In video_observations, "
+            "write one concise summary, up to six concrete details, and any important uncertainty. Do not infer "
+            "identities, locations, products, outcomes, or claims that the video does not establish. Then create "
+            "accurate, engaging social copy grounded in those observations and the creator's context. "
             f"Selected platforms: {', '.join(platforms)}. Existing caption: {current_caption!r}. "
             f"Existing hashtags: {', '.join(hashtags)}. {context_instruction} "
             "Keep each platform's conventions. Every caption and description field must contain body text only: "
@@ -277,27 +321,54 @@ class GeminiClient:
             "Instagram captions within 2200, and YouTube description within 5000 UTF-8 bytes after hashtags are "
             "appended. Use an empty string for an unselected platform. Return only the schema."
         )
-        return await self._generate(
+        result, usage = await self._generate_json(
             [
                 {"fileData": {"mimeType": file.get("mimeType") or file.get("mime_type") or "video/mp4", "fileUri": file["uri"]}},
                 {"text": prompt},
-            ]
+            ],
+            VIDEO_GENERATION_SCHEMA,
+            temperature=0.7,
+            invalid_message="AI returned an invalid video draft",
         )
+        if not all(key in result for key in CANDIDATE_SCHEMA["required"]):
+            raise GeminiError("AI returned an incomplete video draft")
+        try:
+            observations = validate_video_observations(result.pop("video_observations", None))
+        except GeminiError:
+            # The copy is still useful. Older and malformed results can be
+            # re-analyzed explicitly instead of failing the whole AI job.
+            observations = None
+        return result, observations, usage
 
     async def adjust_candidate(
         self,
         candidate: dict,
         adjustment: str,
         generation_context: str = "",
+        *,
+        video_observations: dict | None = None,
+        platforms: list[str] | None = None,
     ) -> tuple[dict, dict]:
         context_instruction = (
-            f"Keep following this creator-provided context (use as guidance, preserve facts, and do not invent details): "
+            "Follow this creator-provided context. It may clarify or correct the observation notes; omit any "
+            "contradicted note, and do not invent further details: "
             f"{generation_context!r}."
             if generation_context.strip()
             else "No additional creator context was provided."
         )
+        observation_instruction = (
+            "Ground every factual claim in these previously observed video details or explicit creator context. "
+            f"Video observations: {json.dumps(video_observations, ensure_ascii=False)}. "
+            if video_observations else "Do not add new factual claims not present in the previous copy or creator context. "
+        )
+        variation_instruction = (
+            "Create a genuinely different version of the wording and opening, not just a small edit. "
+            if adjustment == "regenerate" else f"Apply the '{adjustment}' adjustment. "
+        )
         prompt = (
-            f"Rewrite this social content with the adjustment '{adjustment}'. Preserve facts and return every field. "
+            f"Rewrite this social content. {variation_instruction}{observation_instruction}"
+            f"Selected platforms: {', '.join(platforms or [])}. Use an empty string for unselected platforms. "
+            "Preserve the facts and return every field. "
             "Keep hashtags only in the hashtags array without # characters or spaces; captions must contain body "
             "text only. Preserve all platform limits. "
             f"{context_instruction} Candidate JSON: {json.dumps(candidate, ensure_ascii=False)}"

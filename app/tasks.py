@@ -1164,6 +1164,8 @@ async def _run_ai_generation(job_id: str) -> None:
                     parent.candidate,
                     job.adjustment or "regenerate",
                     job.generation_context or "",
+                    video_observations=parent.video_observations,
+                    platforms=[version.platform for version in post.versions],
                 )
             else:
                 enter_stage("media_lookup")
@@ -1185,13 +1187,16 @@ async def _run_ai_generation(job_id: str) -> None:
                     filename=media.original_name,
                 ) as video_path:
                     gemini_file = await client.upload_file(video_path, media.mime_type)
-                    candidate, usage = await client.create_candidate(
+                    candidate, observations, usage = await client.create_candidate(
                         file=gemini_file,
                         current_caption=post.caption,
                         hashtags=post.hashtags or [],
                         platforms=[version.platform for version in post.versions],
                         generation_context=job.generation_context or "",
                     )
+                    job.video_observations = observations
+                    if observations is None:
+                        logger.warning("ai_job_observations_missing job_id=%s", job.id)
             enter_stage("candidate_validation")
             try:
                 candidate = validate_ai_candidate(

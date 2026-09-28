@@ -31,6 +31,12 @@ class GenerateIn(BaseModel):
 
 class AdjustIn(BaseModel):
     adjustment: str = Field(min_length=3, max_length=32)
+    generation_context: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("generation_context")
+    @classmethod
+    def clean_generation_context(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
 
 def job_out(job: AIGenerationJob) -> dict:
@@ -45,6 +51,7 @@ def job_out(job: AIGenerationJob) -> dict:
         "status": job.status,
         "model": job.model,
         "candidate": job.candidate,
+        "video_observations": job.video_observations,
         "error_code": job.error_code,
         "error_message": job.error_message,
         "created_at": job.created_at,
@@ -193,17 +200,31 @@ async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends
     parent = await db.scalar(select(AIGenerationJob).where(AIGenerationJob.id == job_id, AIGenerationJob.user_id == user.id))
     if not parent or parent.status != "completed" or not parent.candidate:
         raise HTTPException(status_code=409, detail={"code": "ai_candidate_not_ready", "message": "Wait for the current suggestion to finish"})
-    current_media_id = await db.scalar(
-        select(Post.media_id).where(Post.id == parent.post_id, Post.user_id == user.id)
+    current_post = await db.scalar(
+        select(Post)
+        .where(Post.id == parent.post_id, Post.user_id == user.id)
+        .options(selectinload(Post.media), selectinload(Post.versions))
     )
-    if not current_media_id:
+    if not current_post:
         raise HTTPException(status_code=404, detail={"code": "post_not_found", "message": "Draft not found"})
-    if parent.media_id != current_media_id:
+    if parent.media_id != current_post.media_id:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "ai_candidate_stale",
                 "message": "The video changed. Generate a new suggestion for the current video first",
+            },
+        )
+    if current_post.media.status != "ready":
+        raise HTTPException(status_code=409, detail={"code": "media_not_ready", "message": "Finish processing the video first"})
+    if not current_post.versions:
+        raise HTTPException(status_code=422, detail={"code": "platform_required", "message": "Choose at least one platform first"})
+    if adjustment == "regenerate" and not parent.video_observations:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ai_observations_unavailable",
+                "message": "Re-analyze this video before trying another version",
             },
         )
     await consume_usage(db, user.id, "adjustment")
@@ -214,7 +235,8 @@ async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends
         parent_job_id=parent.id,
         kind="adjustment",
         adjustment=adjustment,
-        generation_context=parent.generation_context or "",
+        generation_context=parent.generation_context if payload.generation_context is None else payload.generation_context,
+        video_observations=parent.video_observations,
         status="queued",
         model=get_settings().gemini_model,
     )

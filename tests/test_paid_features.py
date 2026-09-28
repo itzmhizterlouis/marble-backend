@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -21,6 +22,7 @@ from app.models import (
     Subscription,
     User,
 )
+from app.tasks import _run_ai_generation
 
 
 def register(client, email: str) -> tuple[dict, dict[str, str]]:
@@ -330,6 +332,147 @@ def test_ai_adjustment_rejects_candidate_from_replaced_video(client, monkeypatch
     )
     assert adjustment.status_code == 409
     assert adjustment.json()["code"] == "ai_candidate_stale"
+
+
+def test_ai_regeneration_reuses_video_observations_without_fetching_media(client, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "billing_enforcement_enabled", True)
+    monkeypatch.setattr(settings, "gemini_api_key", "test-gemini-key")
+    email = "reusable-ai@example.com"
+    _, headers = register(client, email)
+    asyncio.run(verify_user(email, grant="pro"))
+    post = create_draft(client, headers, "reusable-video")
+    monkeypatch.setattr("app.tasks.run_ai_generation.delay", lambda _job_id: None)
+    original = client.post("/v1/ai/generations", headers=headers, json={"post_id": post["id"]})
+    assert original.status_code == 202, original.text
+
+    candidate = {
+        "shared_caption": "A creator shows a blue bag.",
+        "hashtags": ["handmade"],
+        "tiktok_caption": "",
+        "instagram_caption": "A creator shows a blue bag.",
+        "facebook_title": "",
+        "facebook_caption": "",
+        "youtube_title": "",
+        "youtube_description": "",
+    }
+    observations = {
+        "summary": "A creator shows a bag.",
+        "details": ["Blue stitching is visible."],
+        "uncertainties": [],
+    }
+
+    async def complete_original() -> None:
+        async with SessionLocal() as db:
+            job = await db.get(AIGenerationJob, original.json()["id"])
+            job.status = "completed"
+            job.candidate = candidate
+            await db.commit()
+
+    asyncio.run(complete_original())
+    unavailable = client.post(
+        f"/v1/ai/generations/{original.json()['id']}/adjust",
+        headers=headers,
+        json={"adjustment": "regenerate"},
+    )
+    assert unavailable.status_code == 409
+    assert unavailable.json()["code"] == "ai_observations_unavailable"
+
+    async def add_observations() -> None:
+        async with SessionLocal() as db:
+            job = await db.get(AIGenerationJob, original.json()["id"])
+            job.video_observations = observations
+            await db.commit()
+
+    asyncio.run(add_observations())
+    variant = client.post(
+        f"/v1/ai/generations/{original.json()['id']}/adjust",
+        headers=headers,
+        json={"adjustment": "regenerate", "generation_context": "  Mention the stitching.  "},
+    )
+    assert variant.status_code == 202, variant.text
+    assert variant.json()["kind"] == "adjustment"
+    assert variant.json()["generation_context"] == "Mention the stitching."
+    assert variant.json()["video_observations"] == observations
+
+    calls = []
+
+    class TextOnlyGemini:
+        def __init__(self, on_stage=None):
+            self.on_stage = on_stage
+
+        async def adjust_candidate(self, previous, adjustment, context, **kwargs):
+            calls.append((previous, adjustment, context, kwargs))
+            return {**candidate, "instagram_caption": "See the blue stitching on this handmade bag."}, {}
+
+    monkeypatch.setattr("app.gemini.GeminiClient", TextOnlyGemini)
+    monkeypatch.setattr("app.tasks.materialize_object", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("Video was fetched")))
+    asyncio.run(_run_ai_generation(variant.json()["id"]))
+
+    completed = client.get(f"/v1/ai/generations/{variant.json()['id']}", headers=headers)
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert completed.json()["video_observations"] == observations
+    assert calls[0][1:3] == ("regenerate", "Mention the stitching.")
+    assert calls[0][3]["video_observations"] == observations
+
+
+def test_first_ai_video_job_saves_observations_for_future_variants(client, monkeypatch, tmp_path):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "billing_enforcement_enabled", True)
+    monkeypatch.setattr(settings, "gemini_api_key", "test-gemini-key")
+    email = "first-pass-ai@example.com"
+    _, headers = register(client, email)
+    asyncio.run(verify_user(email, grant="pro"))
+    post = create_draft(client, headers, "first-pass-video")
+    monkeypatch.setattr("app.tasks.run_ai_generation.delay", lambda _job_id: None)
+    queued = client.post("/v1/ai/generations", headers=headers, json={"post_id": post["id"]})
+    assert queued.status_code == 202, queued.text
+
+    observations = {
+        "summary": "A creator shows a handmade bag.",
+        "details": ["The bag has blue stitching."],
+        "uncertainties": [],
+    }
+    candidate = {
+        "shared_caption": "A handmade bag.",
+        "hashtags": [],
+        "tiktok_caption": "",
+        "instagram_caption": "A handmade bag with blue stitching.",
+        "facebook_title": "",
+        "facebook_caption": "",
+        "youtube_title": "",
+        "youtube_description": "",
+    }
+    deleted_files = []
+
+    @asynccontextmanager
+    async def fake_materialize_object(**_kwargs):
+        yield tmp_path / "fake-video.mp4"
+
+    class FirstPassGemini:
+        def __init__(self, on_stage=None):
+            self.on_stage = on_stage
+
+        async def upload_file(self, _path, _mime_type):
+            return {"name": "files/test-video", "uri": "files/test-video"}
+
+        async def create_candidate(self, **_kwargs):
+            return candidate, observations, {"promptTokenCount": 120, "candidatesTokenCount": 80}
+
+        async def delete_file(self, name):
+            deleted_files.append(name)
+
+    monkeypatch.setattr("app.tasks.materialize_object", fake_materialize_object)
+    monkeypatch.setattr("app.gemini.GeminiClient", FirstPassGemini)
+    asyncio.run(_run_ai_generation(queued.json()["id"]))
+
+    completed = client.get(f"/v1/ai/generations/{queued.json()['id']}", headers=headers)
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert completed.json()["video_observations"] == observations
+    assert completed.json()["candidate"] == candidate
+    assert deleted_files == ["files/test-video"]
 
 
 def test_paystack_webhook_signature_and_deduplication(client, monkeypatch):
