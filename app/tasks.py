@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -65,6 +66,17 @@ celery_app.conf.update(
         "enforce-expired-access": {"task": "marble.enforce_expired_access", "schedule": 3600.0},
     },
 )
+
+
+def ai_failure_details(exc: Exception) -> tuple[str, str, int | None]:
+    """Keep provider internals and credential-bearing URLs out of persisted errors."""
+    from .gemini import GeminiError
+
+    if isinstance(exc, GeminiError):
+        return exc.code, str(exc), exc.status_code
+    if isinstance(exc, StorageError):
+        return "ai_media_download_failed", "Could not retrieve your video. Please try again.", None
+    return "ai_generation_failed", "We couldn't generate a suggestion. Please try again.", None
 
 
 def filename_derived_title(title: str | None, filename: str) -> bool:
@@ -1111,10 +1123,38 @@ async def _run_ai_generation(job_id: str) -> None:
         job.started_at = utcnow()
         await db.commit()
         await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id, post_id=job.post_id)
+        started = time.monotonic()
+        stage_started = started
+        stage = "setup"
+
+        def enter_stage(next_stage: str) -> None:
+            nonlocal stage, stage_started
+            now = time.monotonic()
+            logger.info(
+                "ai_job_stage job_id=%s stage=%s duration_ms=%d",
+                job.id,
+                stage,
+                round((now - stage_started) * 1000),
+            )
+            stage = next_stage
+            stage_started = now
+            logger.info("ai_job_stage_started job_id=%s stage=%s", job.id, stage)
+
+        created_at = job.created_at
+        if created_at and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        queue_ms = max(0, round((job.started_at - created_at).total_seconds() * 1000)) if created_at else 0
+        logger.info(
+            "ai_job_started job_id=%s post_id=%s kind=%s queue_ms=%d",
+            job.id,
+            job.post_id,
+            job.kind,
+            queue_ms,
+        )
         client = None
         gemini_file = None
         try:
-            client = GeminiClient()
+            client = GeminiClient(on_stage=enter_stage)
             if job.kind == "adjustment":
                 if not parent or not parent.candidate:
                     raise GeminiError("The previous AI suggestion is no longer available")
@@ -1126,9 +1166,18 @@ async def _run_ai_generation(job_id: str) -> None:
                     job.generation_context or "",
                 )
             else:
+                enter_stage("media_lookup")
                 media = await db.get(MediaAsset, job.media_id)
                 if not media or media.user_id != job.user_id or media.status != "ready":
                     raise GeminiError("The selected video is no longer available")
+                logger.info(
+                    "ai_job_media job_id=%s size_bytes=%d duration_seconds=%s storage_backend=%s",
+                    job.id,
+                    media.size_bytes,
+                    media.duration_seconds,
+                    media.storage_backend,
+                )
+                enter_stage("media_download")
                 async with materialize_object(
                     storage_backend=media.storage_backend,
                     object_key=media.object_key,
@@ -1143,6 +1192,7 @@ async def _run_ai_generation(job_id: str) -> None:
                         platforms=[version.platform for version in post.versions],
                         generation_context=job.generation_context or "",
                     )
+            enter_stage("candidate_validation")
             try:
                 candidate = validate_ai_candidate(
                     candidate, [version.platform for version in post.versions]
@@ -1155,16 +1205,36 @@ async def _run_ai_generation(job_id: str) -> None:
             job.input_tokens = usage.get("promptTokenCount")
             job.output_tokens = usage.get("candidatesTokenCount")
         except Exception as exc:
-            logger.info("AI generation %s failed: %s", job.id, exc)
+            code, message, provider_status = ai_failure_details(exc)
+            logger.warning(
+                "ai_job_failed job_id=%s post_id=%s stage=%s stage_ms=%d total_ms=%d error_class=%s "
+                "error_code=%s provider_status=%s",
+                job.id,
+                job.post_id,
+                stage,
+                round((time.monotonic() - stage_started) * 1000),
+                round((time.monotonic() - started) * 1000),
+                type(exc).__name__,
+                code,
+                provider_status,
+            )
             job.status = "failed"
-            job.error_code = "ai_generation_failed"
-            job.error_message = str(exc)
+            job.error_code = code
+            job.error_message = message
         finally:
             if client and gemini_file and gemini_file.get("name"):
+                enter_stage("gemini_cleanup")
                 try:
                     await client.delete_file(gemini_file["name"])
-                except Exception:
-                    logger.warning("Could not delete Gemini file for job %s", job.id, exc_info=True)
+                except Exception as exc:
+                    logger.warning("ai_job_cleanup_failed job_id=%s error_class=%s", job.id, type(exc).__name__)
+            enter_stage("finished")
+            logger.info(
+                "ai_job_finished job_id=%s status=%s total_ms=%d",
+                job.id,
+                job.status,
+                round((time.monotonic() - started) * 1000),
+            )
         job.completed_at = utcnow()
         await db.commit()
         await publish_realtime_event(job.user_id, "ai.updated", ai_job_id=job.id, post_id=job.post_id)

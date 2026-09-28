@@ -143,6 +143,8 @@ async def create_generation(payload: GenerateIn, user: User = Depends(get_curren
     except HTTPException:
         job.status = "failed"
         job.error_code = "ai_queue_unavailable"
+        job.error_message = "AI creation could not start. Please try again."
+        job.completed_at = datetime.now(UTC)
         await db.commit()
         raise
     return job_out(job)
@@ -223,6 +225,8 @@ async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends
     except HTTPException:
         job.status = "failed"
         job.error_code = "ai_queue_unavailable"
+        job.error_message = "AI creation could not start. Please try again."
+        job.completed_at = datetime.now(UTC)
         await db.commit()
         raise
     return job_out(job)

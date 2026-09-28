@@ -70,12 +70,27 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         body = {**exc.detail, "request_id": request_id}
     else:
         body = {"code": "request_failed", "message": str(exc.detail), "request_id": request_id}
+    if request.url.path.startswith("/v1/ai/"):
+        logger.info(
+            "ai_request_rejected request_id=%s path=%s status=%d code=%s",
+            request_id,
+            request.url.path,
+            exc.status_code,
+            body.get("code", "request_failed"),
+        )
     return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     field_errors = {".".join(map(str, item["loc"][1:])): item["msg"] for item in exc.errors()}
+    if request.url.path.startswith("/v1/ai/"):
+        logger.info(
+            "ai_request_validation request_id=%s path=%s fields=%s",
+            getattr(request.state, "request_id", None),
+            request.url.path,
+            sorted(field_errors),
+        )
     return JSONResponse(
         status_code=422,
         content={

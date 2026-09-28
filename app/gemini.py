@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -10,7 +11,34 @@ from .config import get_settings
 
 
 class GeminiError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "gemini_error", status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
+def _request_error(exc: httpx.RequestError, operation: str) -> GeminiError:
+    if isinstance(exc, httpx.TimeoutException):
+        return GeminiError(
+            "Gemini took too long to respond. Please try again.",
+            code=f"gemini_{operation}_timeout",
+        )
+    return GeminiError(
+        "Could not reach Gemini. Please try again.",
+        code=f"gemini_{operation}_network_error",
+    )
+
+
+def _response_error(response: httpx.Response, operation: str, message: str) -> GeminiError:
+    if response.status_code == 429:
+        message = "Gemini is busy right now. Please try again shortly."
+        code = f"gemini_{operation}_rate_limited"
+    elif response.status_code >= 500:
+        message = "Gemini is temporarily unavailable. Please try again."
+        code = f"gemini_{operation}_server_error"
+    else:
+        code = f"gemini_{operation}_http_error"
+    return GeminiError(message, code=code, status_code=response.status_code)
 
 
 CANDIDATE_SCHEMA = {
@@ -68,10 +96,15 @@ ANALYTICS_INSIGHTS_SCHEMA = {
 
 
 class GeminiClient:
-    def __init__(self) -> None:
+    def __init__(self, on_stage: Callable[[str], None] | None = None) -> None:
         self.settings = get_settings()
+        self.on_stage = on_stage
         if not self.settings.gemini_api_key:
             raise GeminiError("Gemini is not configured")
+
+    def _stage(self, name: str) -> None:
+        if self.on_stage:
+            self.on_stage(name)
 
     async def _file_stream(self, path: Path):
         with path.open("rb") as source:
@@ -89,39 +122,57 @@ class GeminiClient:
             "Content-Type": "application/json",
         }
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(start_url, headers=headers, json={"file": {"display_name": path.name}})
+            self._stage("gemini_upload_session")
+            try:
+                response = await client.post(start_url, headers=headers, json={"file": {"display_name": path.name}})
+            except httpx.RequestError as exc:
+                raise _request_error(exc, "upload_session") from exc
             if response.is_error or not response.headers.get("X-Goog-Upload-URL"):
-                raise GeminiError("Gemini could not accept this video")
+                raise _response_error(response, "upload_session", "Gemini could not accept this video")
             upload_url = response.headers["X-Goog-Upload-URL"]
-            response = await client.post(
-                upload_url,
-                headers={
-                    "X-Goog-Upload-Offset": "0",
-                    "X-Goog-Upload-Command": "upload, finalize",
-                    "Content-Length": str(size),
-                    "Content-Type": mime_type,
-                },
-                content=self._file_stream(path),
-                timeout=None,
-            )
+            self._stage("gemini_upload")
+            try:
+                response = await client.post(
+                    upload_url,
+                    headers={
+                        "X-Goog-Upload-Offset": "0",
+                        "X-Goog-Upload-Command": "upload, finalize",
+                        "Content-Length": str(size),
+                        "Content-Type": mime_type,
+                    },
+                    content=self._file_stream(path),
+                    timeout=None,
+                )
+            except httpx.RequestError as exc:
+                raise _request_error(exc, "upload") from exc
             if response.is_error:
-                raise GeminiError("Gemini video upload failed")
-            body = response.json()
+                raise _response_error(response, "upload", "Gemini video upload failed")
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise GeminiError("Gemini returned an invalid video response", code="gemini_upload_invalid_response") from exc
             file = body.get("file") or body
+            self._stage("gemini_processing")
             for _ in range(60):
                 state = str(file.get("state") or "ACTIVE")
                 if state == "ACTIVE":
                     return file
                 if state == "FAILED":
-                    raise GeminiError("Gemini could not process this video")
+                    raise GeminiError("Gemini could not process this video", code="gemini_processing_failed")
                 await asyncio.sleep(2)
-                file_response = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/{file['name']}?key={self.settings.gemini_api_key}"
-                )
+                try:
+                    file_response = await client.get(
+                        f"https://generativelanguage.googleapis.com/v1beta/{file['name']}?key={self.settings.gemini_api_key}"
+                    )
+                except httpx.RequestError as exc:
+                    raise _request_error(exc, "processing") from exc
                 if file_response.is_error:
-                    raise GeminiError("Gemini video processing failed")
-                file = file_response.json()
-        raise GeminiError("Gemini video processing timed out")
+                    raise _response_error(file_response, "processing", "Gemini video processing failed")
+                try:
+                    file = file_response.json()
+                except ValueError as exc:
+                    raise GeminiError("Gemini returned an invalid video response", code="gemini_processing_invalid_response") from exc
+        raise GeminiError("Gemini video processing timed out", code="gemini_processing_timeout")
 
     async def delete_file(self, name: str) -> None:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -149,11 +200,18 @@ class GeminiClient:
                 "temperature": temperature,
             },
         }
+        self._stage("gemini_generation")
         async with httpx.AsyncClient(timeout=180) as client:
-            response = await client.post(url, json=payload)
+            try:
+                response = await client.post(url, json=payload)
+            except httpx.RequestError as exc:
+                raise _request_error(exc, "generation") from exc
         if response.is_error:
-            raise GeminiError("AI creation is temporarily unavailable")
-        body = response.json()
+            raise _response_error(response, "generation", "AI creation is temporarily unavailable")
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise GeminiError("AI returned an invalid response", code="gemini_generation_invalid_response") from exc
         try:
             text = body["candidates"][0]["content"]["parts"][0]["text"]
             result = json.loads(text)
