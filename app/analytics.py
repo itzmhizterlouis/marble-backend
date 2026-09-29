@@ -982,6 +982,15 @@ async def get_post_analytics(post_id: str, user: User = Depends(get_current_user
             None,
         )
         source = successful or latest
+        history = [
+            {
+                "captured_at": snapshot.captured_at,
+                "exposure": _number((snapshot.normalized_metrics or {}).get("exposure")),
+            }
+            for snapshot in reversed(snapshots)
+            if snapshot.provider_status == "available"
+            and _number((snapshot.normalized_metrics or {}).get("exposure")) is not None
+        ]
         items.append(
             {
                 "platform": publication.platform,
@@ -989,6 +998,7 @@ async def get_post_analytics(post_id: str, user: User = Depends(get_current_user
                 "primary_metric": source.primary_metric if source else None,
                 "primary_label": source.primary_label if source else None,
                 "captured_at": source.captured_at if source else None,
+                "history": history,
                 "availability": latest.provider_status if latest else "pending",
                 "stale": bool(latest and successful and latest.id != successful.id),
                 "error": latest.error_message if latest else None,

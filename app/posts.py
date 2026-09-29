@@ -291,7 +291,7 @@ async def update_post(
 
 @router.get("", response_model=PostListOut)
 async def list_posts(
-    status: str = Query(default="all", pattern="^(all|published|failed|scheduled|draft)$"),
+    status: str = Query(default="all", pattern="^(all|published|failed|scheduled|draft|analytics)$"),
     limit: int = Query(default=50, ge=1, le=100),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -311,6 +311,8 @@ async def list_posts(
         query = query.where(Post.status == "scheduled")
     elif status == "draft":
         query = query.where(Post.status.in_(["draft", "cancelled"]))
+    elif status == "analytics":
+        query = query.where(Post.publications.any(Publication.status == "published"))
     posts = list(await db.scalars(query))
     return PostListOut(items=[post_out(post) for post in posts])
 
