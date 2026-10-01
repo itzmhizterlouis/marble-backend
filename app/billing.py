@@ -378,7 +378,7 @@ async def apply_billing_event(db: AsyncSession, event: BillingEvent) -> None:
         subscription.paystack_subscription_code = code or subscription.paystack_subscription_code
         subscription.paystack_email_token = str(data.get("email_token") or "") or subscription.paystack_email_token
         subscription.paystack_customer_code = str(customer.get("customer_code") or "") or subscription.paystack_customer_code
-        next_payment = _parse_time(data.get("next_payment_date"))
+        next_payment = _parse_time(data.get("next_payment_date") or nested_subscription.get("next_payment_date"))
         if (
             payment_matches_plan
             and name in {"subscription.create", "charge.success", "invoice.update"}
@@ -386,7 +386,13 @@ async def apply_billing_event(db: AsyncSession, event: BillingEvent) -> None:
         ):
             subscription.status = "active"
             subscription.grace_until = None
-            subscription.paid_through = next_payment or subscription.paid_through or utcnow() + timedelta(days=31)
+            paid_at = _parse_time(data.get("paid_at") or data.get("paidAt"))
+            # charge.success can omit next_payment_date. Derive the period
+            # from that payment's timestamp, never from notification time:
+            # duplicates and older events must not add or remove access.
+            period_end = next_payment or (next_month(paid_at) if name == "charge.success" and paid_at else None)
+            current_end = _parse_time(subscription.paid_through)
+            subscription.paid_through = max(current_end, period_end) if current_end and period_end else period_end or current_end or utcnow() + timedelta(days=31)
             if previous_to_disable:
                 previous_to_disable.status = "replaced"
                 previous_to_disable.cancel_at_period_end = True

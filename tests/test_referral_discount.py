@@ -122,11 +122,17 @@ def test_discount_and_original_price_commission_are_once_only(client, monkeypatc
             assert checkout.authorization_code is None
             renewal_event = BillingEvent(provider_event_id=f"renewal-{suffix}", event_type="charge.success", payload={"event": "charge.success", "data": {
                 **payments[reference], "reference": f"renewal-{reference}", "amount": earned.commission_base_kobo,
-                "subscription_code": f"SUB_{suffix}", "next_payment_date": next_month(next_month(paid_at)).isoformat(),
+                "subscription_code": f"SUB_{suffix}", "paid_at": next_month(paid_at).isoformat(),
             }})
             db.add(renewal_event)
             await db.commit()
             await apply_billing_event(db, renewal_event)
+            assert (await db.get(Subscription, checkout.subscription_id)).paid_through.replace(tzinfo=UTC) == next_month(next_month(paid_at))
+            duplicate = BillingEvent(provider_event_id=f"renewal-duplicate-{suffix}", event_type="charge.success", payload=renewal_event.payload)
+            db.add(duplicate)
+            await db.commit()
+            await apply_billing_event(db, duplicate)
+            assert (await db.get(Subscription, checkout.subscription_id)).paid_through.replace(tzinfo=UTC) == next_month(next_month(paid_at))
             assert await db.scalar(select(func.count(AffiliateCommission.id)).where(AffiliateCommission.referred_user_id == creator.id)) == 1
             refund = BillingEvent(provider_event_id=f"refund-{suffix}", event_type="refund.processed", payload={"event": "refund.processed", "data": {"transaction_reference": reference}})
             db.add(refund)
