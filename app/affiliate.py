@@ -52,7 +52,7 @@ async def resolve_referrer(db: AsyncSession, code: str | None) -> User | None:
     return referrer
 
 
-async def record_first_payment(db: AsyncSession, user: User, reference: str, amount_kobo: int, subscription_id: str | None = None, paid_at: datetime | None = None) -> AffiliateCommission | None:
+async def record_first_payment(db: AsyncSession, user: User, reference: str, amount_kobo: int, subscription_id: str | None = None, paid_at: datetime | None = None, *, commission_base_kobo: int | None = None) -> AffiliateCommission | None:
     if not reference or amount_kobo <= 0:
         return None
     locked = await db.scalar(select(User).where(User.id == user.id).with_for_update())
@@ -77,7 +77,8 @@ async def record_first_payment(db: AsyncSession, user: User, reference: str, amo
         return None
     if await db.get(AffiliatePaymentReversal, reference):
         return None
-    amount = amount_kobo * 20 // 100
+    base = commission_base_kobo if commission_base_kobo is not None else amount_kobo
+    amount = base * 20 // 100
     payment_time = paid_at.replace(tzinfo=UTC) if paid_at and paid_at.tzinfo is None else paid_at or utcnow()
     commission = AffiliateCommission(
         referrer_user_id=locked.referred_by_user_id,
@@ -85,6 +86,7 @@ async def record_first_payment(db: AsyncSession, user: User, reference: str, amo
         payment_reference=reference,
         subscription_id=subscription_id,
         payment_amount_kobo=amount_kobo,
+        commission_base_kobo=base,
         amount_kobo=amount,
         available_at=payment_time + timedelta(days=7),
     )

@@ -30,6 +30,7 @@ from .models import (
     Post,
     Publication,
     PublicationAttempt,
+    ReferralCheckout,
     Subscription,
     User,
     utcnow,
@@ -925,6 +926,7 @@ def process_billing_event(event_id: str) -> None:
 
 async def _process_pending_billing_events() -> None:
     from .billing import apply_billing_event
+    from .referral_billing import setup_referral_renewal
 
     async with TaskSessionLocal() as db:
         events = list(
@@ -938,6 +940,16 @@ async def _process_pending_billing_events() -> None:
             except Exception:
                 await db.rollback()
                 logger.exception("Could not process billing event %s", event.id)
+        user_ids = list(await db.scalars(select(ReferralCheckout.user_id).where(
+            ReferralCheckout.renewal_state.in_(["pending", "creating", "uncertain"]),
+            ReferralCheckout.paid_at.is_not(None),
+        ).limit(100)))
+        for user_id in user_ids:
+            try:
+                await setup_referral_renewal(db, user_id)
+            except Exception:
+                await db.rollback()
+                logger.warning("Could not reconcile referral renewal for user %s", user_id)
 
 
 @celery_app.task(name="marble.process_pending_billing_events")

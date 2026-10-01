@@ -309,6 +309,25 @@ class BillingEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ReferralCheckout(Base, TimestampMixin):
+    __tablename__ = "referral_checkouts"
+
+    # One reusable checkout per creator prevents concurrent discounted charges.
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    reference: Mapped[str] = mapped_column(String(255), unique=True)
+    plan: Mapped[str] = mapped_column(String(16))
+    original_amount_kobo: Mapped[int] = mapped_column(BigInteger)
+    amount_kobo: Mapped[int] = mapped_column(BigInteger)
+    authorization_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    subscription_id: Mapped[str | None] = mapped_column(ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    customer_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    authorization_code: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    renewal_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    renewal_state: Mapped[str] = mapped_column(String(24), default="unpaid", index=True)
+    renewal_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class AffiliateCommission(Base, TimestampMixin):
     __tablename__ = "affiliate_commissions"
 
@@ -318,6 +337,7 @@ class AffiliateCommission(Base, TimestampMixin):
     payment_reference: Mapped[str] = mapped_column(String(255), unique=True)
     subscription_id: Mapped[str | None] = mapped_column(ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True)
     payment_amount_kobo: Mapped[int] = mapped_column(BigInteger)
+    commission_base_kobo: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     amount_kobo: Mapped[int] = mapped_column(BigInteger)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

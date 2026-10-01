@@ -34,17 +34,31 @@ class PaystackClient:
             raise PaystackError(str(body.get("message") or "Paystack request failed"), response.status_code)
         return body.get("data") or {}
 
-    async def initialize_checkout(self, *, email: str, plan_code: str, plan: str, user_id: str) -> dict:
+    async def initialize_checkout(self, *, email: str, plan_code: str, plan: str, user_id: str, amount_kobo: int | None = None, reference: str | None = None) -> dict:
+        payload = {
+            "email": email,
+            "callback_url": self.settings.paystack_callback_url,
+            "metadata": {"reverb_user_id": user_id, "reverb_plan": plan},
+        }
+        if amount_kobo is None:
+            payload["plan"] = plan_code
+        else:
+            # A plan overrides amount. Charge the discounted month separately,
+            # then use its reusable authorization for full-price renewal.
+            payload.update(amount=amount_kobo, currency="NGN", channels=["card"], reference=reference)
         return await self._request(
             "POST",
             "/transaction/initialize",
-            json={
-                "email": email,
-                "plan": plan_code,
-                "callback_url": self.settings.paystack_callback_url,
-                "metadata": {"reverb_user_id": user_id, "reverb_plan": plan},
-            },
+            json=payload,
         )
+
+    async def create_subscription(self, customer: str, plan_code: str, authorization: str, start_date: str) -> dict:
+        return await self._request("POST", "/subscription", json={
+            "customer": customer, "plan": plan_code, "authorization": authorization, "start_date": start_date,
+        })
+
+    async def list_subscriptions(self, customer_id: str) -> list[dict]:
+        return await self._request("GET", "/subscription", params={"customer": customer_id, "perPage": 100})
 
     async def verify_transaction(self, reference: str) -> dict:
         return await self._request("GET", f"/transaction/verify/{reference}")
