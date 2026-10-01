@@ -17,7 +17,7 @@ def account(client, email, code=None):
     assert response.status_code == 201, response.text
     async def verified():
         async with SessionLocal() as db:
-            user = await db.scalar(select(User).where(User.email == email))
+            user = await db.scalar(select(User).where(User.email == email.casefold()))
             user.email_verified = True
             await db.commit()
             return user
