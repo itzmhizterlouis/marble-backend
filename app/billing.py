@@ -68,7 +68,8 @@ async def activate_transaction(db: AsyncSession, user: User, data: dict, request
         raise HTTPException(status_code=403, detail={"code": "payment_owner_mismatch", "message": "This payment belongs to another account"})
     plan = referral_checkout.plan if referral_checkout else requested_plan or metadata.get("reverb_plan")
     plan_payload = data.get("plan") if isinstance(data.get("plan"), dict) else {}
-    plan_code = str(plan_payload.get("plan_code") or data.get("plan_object", {}).get("plan_code") or "")
+    plan_object = data.get("plan_object") if isinstance(data.get("plan_object"), dict) else {}
+    plan_code = str(plan_payload.get("plan_code") or plan_object.get("plan_code") or "")
     if plan not in PLAN_AMOUNTS:
         settings = get_settings()
         plan = "basic" if plan_code == settings.paystack_basic_plan_code else "pro" if plan_code == settings.paystack_pro_plan_code else None

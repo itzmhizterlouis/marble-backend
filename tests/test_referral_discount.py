@@ -87,6 +87,7 @@ def test_discount_and_original_price_commission_are_once_only(client, monkeypatc
     paid_at = datetime.now(UTC)
     payments[reference] = {
         "reference": reference, "status": "success", "amount": charged, "currency": "NGN",
+        "plan": None, "plan_object": None,
         "paid_at": paid_at.isoformat(), "metadata": {"reverb_user_id": creator.id, "reverb_plan": plan},
         "customer": {"id": 123, "email": creator.email, "customer_code": "CUS_creator"},
         "authorization": {"authorization_code": "AUTH_creator", "reusable": True},

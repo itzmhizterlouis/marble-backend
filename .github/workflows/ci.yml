@@ -7,6 +7,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: reverb_migration_test
+          POSTGRES_USER: reverb_test
+          POSTGRES_PASSWORD: test_only_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U reverb_test -d reverb_migration_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,3 +30,17 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check app tests
       - run: pytest -q
+      - name: Verify referral migration and concurrent payments on PostgreSQL
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: postgresql+asyncpg://reverb_test:test_only_password@localhost:5432/reverb_migration_test
+          JWT_SECRET: test-secret-with-at-least-thirty-two-characters
+          AFFILIATE_ENABLED: "true"
+        run: |
+          alembic upgrade 0015_ai_video_observations
+          python tests/check_referral_migration.py seed
+          alembic upgrade head
+          python tests/check_referral_migration.py check-backfill
+          alembic downgrade 0015_ai_video_observations
+          alembic upgrade head
+          python tests/check_referral_migration.py check-concurrency
