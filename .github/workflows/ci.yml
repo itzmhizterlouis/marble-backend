@@ -37,7 +37,8 @@ jobs:
           JWT_SECRET: test-secret-with-at-least-thirty-two-characters
           AFFILIATE_ENABLED: "true"
         run: |
-          alembic upgrade 0015_ai_video_observations
+          alembic upgrade head
+          alembic downgrade 0015_ai_video_observations
           python tests/check_referral_migration.py seed
           alembic upgrade head
           python tests/check_referral_migration.py check-backfill

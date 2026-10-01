@@ -11,8 +11,15 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("affiliate_commissions", sa.Column("commission_base_kobo", sa.BigInteger(), nullable=True))
-    op.execute("UPDATE affiliate_commissions SET commission_base_kobo = payment_amount_kobo")
+    inspector = sa.inspect(op.get_bind())
+    # The initial migration creates current model metadata on fresh installs.
+    # Existing deployments still need these additions, so handle both paths.
+    columns = {column["name"] for column in inspector.get_columns("affiliate_commissions")}
+    if "commission_base_kobo" not in columns:
+        op.add_column("affiliate_commissions", sa.Column("commission_base_kobo", sa.BigInteger(), nullable=True))
+    op.execute("UPDATE affiliate_commissions SET commission_base_kobo = payment_amount_kobo WHERE commission_base_kobo IS NULL")
+    if "referral_checkouts" in inspector.get_table_names():
+        return
     op.create_table(
         "referral_checkouts",
         sa.Column("user_id", sa.String(36), sa.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
