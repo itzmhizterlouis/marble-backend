@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
+import math
 from collections import defaultdict
-from datetime import UTC, date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from statistics import median
-from typing import Any
+from typing import Any, Literal
 
 from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -45,13 +47,30 @@ def _number(value: Any) -> int | float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return value
+        return value if math.isfinite(value) else None
     if isinstance(value, str):
         try:
-            return float(value.replace(",", ""))
+            parsed = float(value.replace(",", ""))
+            return parsed if math.isfinite(parsed) else None
         except ValueError:
             return None
     return None
+
+
+def primary_metric_label(platform: str, primary: str | None) -> str | None:
+    """Name the returned metric, not the platform's usual preferred metric."""
+    if not primary:
+        return None
+    key = primary.rsplit(".", 1)[-1]
+    if key == "reach":
+        return "People reached" if platform == "facebook" else "Accounts reached"
+    if key in {"impressions", "post_impressions"}:
+        return "Impressions"
+    if key in {"plays", "play_count"}:
+        return "Plays"
+    if key in {"views", "video_views", "view_count"}:
+        return "Video views" if platform == "tiktok" else "Views"
+    return key.replace("_", " ").capitalize()
 
 
 def flatten_metrics(payload: Any, prefix: str = "") -> dict[str, int | float]:
@@ -74,7 +93,7 @@ def flatten_metrics(payload: Any, prefix: str = "") -> dict[str, int | float]:
 def normalize_metrics(platform: str, payload: dict) -> tuple[dict, str | None, str | None]:
     metric_payload = payload.get("post_metrics") if isinstance(payload.get("post_metrics"), dict) else payload
     flattened = flatten_metrics(metric_payload)
-    candidates, label = PRIMARY_METRICS.get(platform, (("views", "reach", "impressions"), "Exposure"))
+    candidates, _ = PRIMARY_METRICS.get(platform, (("views", "reach", "impressions"), "Exposure"))
     preferred = payload.get("primary_impressions_field")
     primary = (
         str(preferred).lower()
@@ -92,7 +111,7 @@ def normalize_metrics(platform: str, payload: dict) -> tuple[dict, str | None, s
             None,
         ),
     }
-    return normalized, primary, str(metric_labels.get(primary) or label) if primary else None
+    return normalized, primary, str(metric_labels.get(primary) or primary_metric_label(platform, primary)) if primary else None
 
 
 def platform_payload(payload: dict, platform: str) -> dict:
@@ -959,6 +978,142 @@ async def get_overview(
     return await analytics_overview(db, user, int(period[:-1]))
 
 
+def snapshot_result(publication: Publication, latest: PublicationMetricSnapshot | None,
+                    successful: PublicationMetricSnapshot | None) -> dict:
+    source = successful or latest
+    metrics = None
+    primary = source.primary_metric if source else None
+    label = primary_metric_label(publication.platform, primary)
+    if source:
+        metrics = {key: _number(value) for key, value in (source.normalized_metrics or {}).items()}
+        # Correct historical fallback labels too; do not require a provider call.
+        if isinstance(source.raw_metrics.get("post_metrics"), dict):
+            metrics, primary, label = normalize_metrics(publication.platform, source.raw_metrics)
+        elif source.raw_metrics:
+            normalized, raw_primary, raw_label = normalize_metrics(publication.platform, source.raw_metrics)
+            if raw_primary:
+                metrics, primary, label = normalized, raw_primary, raw_label
+    return {
+        "platform": publication.platform,
+        "metrics": metrics,
+        "primary_metric": primary,
+        "primary_label": label,
+        "captured_at": source.captured_at if source else None,
+        "availability": latest.provider_status if latest else "pending",
+        "stale": bool(latest and successful and latest.id != successful.id),
+        "error": latest.error_message if latest else None,
+        "last_attempt_at": latest.captured_at if latest else None,
+    }
+
+
+async def latest_publication_snapshots(db: AsyncSession, ids: list[str], *, successful: bool = False) -> dict:
+    if not ids:
+        return {}
+    ranked = select(
+        PublicationMetricSnapshot.id,
+        func.row_number().over(
+            partition_by=PublicationMetricSnapshot.publication_id,
+            order_by=(PublicationMetricSnapshot.captured_at.desc(), PublicationMetricSnapshot.id.desc()),
+        ).label("position"),
+    ).where(PublicationMetricSnapshot.publication_id.in_(ids))
+    if successful:
+        ranked = ranked.where(PublicationMetricSnapshot.provider_status == "available")
+    ranked = ranked.subquery()
+    snapshots = await db.scalars(
+        select(PublicationMetricSnapshot).join(ranked, ranked.c.id == PublicationMetricSnapshot.id)
+        .where(ranked.c.position == 1)
+    )
+    return {snapshot.publication_id: snapshot for snapshot in snapshots}
+
+
+async def refresh_available_at(db: AsyncSession, user_id: str) -> datetime | None:
+    latest = await db.scalar(
+        select(func.max(AccountAnalyticsSnapshot.captured_at)).where(AccountAnalyticsSnapshot.user_id == user_id)
+    )
+    if not latest:
+        return None
+    return latest.replace(tzinfo=UTC) + timedelta(minutes=15) if latest.tzinfo is None else latest + timedelta(minutes=15)
+
+
+@router.get("/posts")
+async def list_post_performance(
+    platform: Literal["instagram", "tiktok", "youtube", "facebook"] = "instagram",
+    period: Literal["7d", "30d", "90d"] = "30d",
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = Query(default=None, max_length=1500),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Latest lifetime metrics for posts published on ONE platform in a date window.
+
+    Reads local snapshots in a bounded number of queries. Loading a page never
+    refreshes Upload-Post or runs AI. A cursor fixes the window across pages.
+    """
+    await require_capability(db, user, "analytics")
+    now = utcnow()
+    window_end = now
+    before = None
+    before_id = None
+    if cursor:
+        try:
+            data = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+            if (data["user"] != user.id or data["platform"] != platform or data["period"] != period
+                    or data["v"] != 1):
+                raise ValueError("Cursor belongs to a different query")
+            window_end = datetime.fromisoformat(data["end"])
+            before = datetime.fromisoformat(data["before"])
+            before_id = data["id"]
+            if (window_end.tzinfo is None or before.tzinfo is None or window_end > now
+                    or before > window_end or not isinstance(before_id, str) or len(before_id) != 36):
+                raise ValueError("Invalid cursor bounds")
+        except (ValueError, TypeError, KeyError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_analytics_cursor", "message": "Reload this platform's posts to continue"}) from exc
+    start = window_end - timedelta(days=int(period[:-1]))
+    query = (
+        select(Publication).join(Post, Publication.post_id == Post.id)
+        .where(Post.user_id == user.id, Publication.platform == platform,
+               Publication.status == "published", Publication.published_at >= start,
+               Publication.published_at <= window_end)
+        .options(selectinload(Publication.post).selectinload(Post.media))
+        .order_by(Publication.published_at.desc(), Publication.id.desc()).limit(limit + 1)
+    )
+    if before:
+        query = query.where(or_(Publication.published_at < before,
+                                and_(Publication.published_at == before, Publication.id < before_id)))
+    rows = list(await db.scalars(query))
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    ids = [row.id for row in rows]
+    latest = await latest_publication_snapshots(db, ids)
+    successful = await latest_publication_snapshots(db, ids, successful=True)
+    from .media_routes import media_out
+    items = []
+    for publication in rows:
+        post = publication.post
+        items.append({
+            "post_id": post.id,
+            "title": publication.submitted_title if publication.submitted_title is not None else post.title,
+            "caption": publication.submitted_caption if publication.submitted_caption is not None else post.caption,
+            "thumbnail_url": media_out(post.media).thumbnail_url,
+            "duration_seconds": post.media.duration_seconds,
+            "published_at": publication.published_at,
+            "url": publication.url,
+            "analytics": snapshot_result(publication, latest.get(publication.id), successful.get(publication.id)),
+        })
+    next_cursor = None
+    if has_more:
+        last = rows[-1]
+        published = last.published_at
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=UTC)
+        next_cursor = base64.urlsafe_b64encode(json.dumps({
+            "v": 1, "user": user.id, "platform": platform, "period": period,
+            "end": window_end.isoformat(), "before": published.isoformat(), "id": last.id,
+        }).encode()).decode().rstrip("=")
+    return {"items": items, "next_cursor": next_cursor, "platform": platform, "period": period,
+            "refresh_available_at": await refresh_available_at(db, user.id)}
+
+
 @router.get("/posts/{post_id}")
 async def get_post_analytics(post_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await require_capability(db, user, "analytics")
@@ -981,7 +1136,6 @@ async def get_post_analytics(post_id: str, user: User = Depends(get_current_user
             (item for item in snapshots if item.provider_status == "available"),
             None,
         )
-        source = successful or latest
         history = [
             {
                 "captured_at": snapshot.captured_at,
@@ -991,19 +1145,7 @@ async def get_post_analytics(post_id: str, user: User = Depends(get_current_user
             if snapshot.provider_status == "available"
             and _number((snapshot.normalized_metrics or {}).get("exposure")) is not None
         ]
-        items.append(
-            {
-                "platform": publication.platform,
-                "metrics": source.normalized_metrics if source else None,
-                "primary_metric": source.primary_metric if source else None,
-                "primary_label": source.primary_label if source else None,
-                "captured_at": source.captured_at if source else None,
-                "history": history,
-                "availability": latest.provider_status if latest else "pending",
-                "stale": bool(latest and successful and latest.id != successful.id),
-                "error": latest.error_message if latest else None,
-            }
-        )
+        items.append({**snapshot_result(publication, latest, successful), "history": history})
     return {"post_id": post.id, "items": items}
 
 
@@ -1022,4 +1164,4 @@ async def refresh_analytics(user: User = Depends(get_current_user), db: AsyncSes
         sync_analytics.delay(user.id, True)
     except CeleryError as exc:
         raise HTTPException(status_code=503, detail={"code": "analytics_queue_unavailable", "message": "Analytics refresh is temporarily unavailable"}) from exc
-    return {"message": "Analytics refresh started"}
+    return {"message": "Analytics refresh started", "refresh_available_at": utcnow() + timedelta(minutes=15)}
