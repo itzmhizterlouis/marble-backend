@@ -862,3 +862,27 @@ def test_initial_generation_validates_styles():
     for choices in [["unknown"], ["retry_x"], ["regenerate"], ["shorter"] * 5]:
         with pytest.raises(ValidationError):
             GenerateIn(post_id="draft", adjustments=choices)
+
+
+def test_admin_users_paginate_by_twenty_and_filter_to_creators_with_posts(client, monkeypatch):
+    settings = get_settings()
+    admin_email = "page-admin@example.com"
+    monkeypatch.setattr(settings, "admin_emails", admin_email)
+    _, admin_headers = register(client, admin_email)
+    poster_headers = None
+    for index in range(21):
+        _, headers = register(client, f"paging-{index:02d}@example.com")
+        if index == 3:
+            poster_headers = headers
+            asyncio.run(verify_user("paging-03@example.com"))
+    create_draft(client, poster_headers, "paging-post")
+
+    first = client.get("/v1/admin/users?q=paging-", headers=admin_headers).json()
+    second = client.get("/v1/admin/users?q=paging-&page=2", headers=admin_headers).json()
+    with_posts = client.get("/v1/admin/users?q=paging-&has_posts=true", headers=admin_headers).json()
+
+    assert len(first["items"]) == 20 and first["matching_users"] == 21 and first["pages"] == 2
+    assert [item["email"] for item in second["items"]] != [item["email"] for item in first["items"]]
+    assert len(second["items"]) == 1 and second["page"] == 2
+    assert [item["email"] for item in with_posts["items"]] == ["paging-03@example.com"]
+    assert with_posts["matching_users"] == 1 and with_posts["pages"] == 1

@@ -25,6 +25,9 @@ from .models import (
 from .paystack import PaystackClient, PaystackError
 from .providers import ProviderError, UploadPostClient
 
+ADMIN_USERS_PAGE_SIZE = 20
+CONNECTED_STATUSES = ("connected", "needs_selection")
+
 router = APIRouter(prefix="/v1/admin", tags=["admin"])
 
 
@@ -51,6 +54,9 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
 @router.get("/users")
 async def list_users(
     q: str = Query(default="", max_length=160),
+    page: int = Query(default=1, ge=1, le=100000),
+    has_posts: bool = Query(default=False),
+    has_connections: bool = Query(default=False),
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -59,20 +65,38 @@ async def list_users(
         select(User, func.count(Post.id).label("post_count"))
         .outerjoin(Post, Post.user_id == User.id)
         .group_by(User.id)
-        .order_by(User.created_at.desc())
-        .limit(100)
     )
     if q.strip():
         search = f"%{q.strip()}%"
         query = query.where(or_(User.email.ilike(search), User.name.ilike(search)))
-    users = (await db.execute(query)).all()
+    if has_posts:
+        query = query.having(func.count(Post.id) > 0)
+    if has_connections:
+        query = query.where(
+            select(SocialConnection.id)
+            .where(
+                SocialConnection.user_id == User.id,
+                SocialConnection.status.in_(CONNECTED_STATUSES),
+            )
+            .exists()
+        )
+    matching = await db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    pages = max(1, -(-matching // ADMIN_USERS_PAGE_SIZE))
+    page = min(page, pages)
+    users = (
+        await db.execute(
+            query.order_by(User.created_at.desc(), User.id)
+            .limit(ADMIN_USERS_PAGE_SIZE)
+            .offset((page - 1) * ADMIN_USERS_PAGE_SIZE)
+        )
+    ).all()
     connected: dict[str, list[str]] = {}
     if users:
         rows = await db.execute(
             select(SocialConnection.user_id, SocialConnection.platform)
             .where(
                 SocialConnection.user_id.in_([user.id for user, _ in users]),
-                SocialConnection.status.in_(["connected", "needs_selection"]),
+                SocialConnection.status.in_(CONNECTED_STATUSES),
             )
             .order_by(SocialConnection.platform)
         )
@@ -86,6 +110,10 @@ async def list_users(
     return {
         "total_users": totals[0],
         "verified_users": totals[1],
+        "matching_users": matching,
+        "page": page,
+        "pages": pages,
+        "page_size": ADMIN_USERS_PAGE_SIZE,
         "items": [
             {
                 "id": user.id,

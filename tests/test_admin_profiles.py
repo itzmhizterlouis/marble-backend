@@ -190,3 +190,19 @@ def test_admin_list_reports_platform_totals(client, monkeypatch):
     assert any(item["id"] == user_id for item in body["items"])
     assert body["total_users"] >= 2
     assert 1 <= body["verified_users"] <= body["total_users"]
+
+
+def test_admin_list_filters_to_creators_with_connected_accounts(client, monkeypatch):
+    admin_headers, user_id, _ = setup(client, monkeypatch, "conn-filter-on@example.com")
+    other, _ = register(client, "conn-filter-expired@example.com")
+
+    async def expire_only() -> None:
+        async with SessionLocal() as db:
+            db.add(SocialConnection(user_id=other["user"]["id"], platform="youtube", status="expired"))
+            await db.commit()
+
+    asyncio.run(expire_only())
+    body = client.get("/v1/admin/users?q=conn-filter-&has_connections=true", headers=admin_headers).json()
+
+    assert [item["id"] for item in body["items"]] == [user_id]
+    assert body["matching_users"] == 1
