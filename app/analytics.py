@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from redis.exceptions import RedisError
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -35,6 +37,7 @@ from .providers import ProviderError, UploadPostClient
 
 router = APIRouter(prefix="/v1/analytics", tags=["analytics"])
 logger = logging.getLogger(__name__)
+ANALYTICS_PLATFORMS = ("instagram", "tiktok", "youtube", "facebook", "x", "linkedin")
 PRIMARY_METRICS = {
     "tiktok": (("views", "video_views", "play_count"), "Video views"),
     "instagram": (("reach", "views", "impressions", "plays"), "Accounts reached"),
@@ -112,6 +115,59 @@ def normalize_metrics(platform: str, payload: dict) -> tuple[dict, str | None, s
         ),
     }
     return normalized, primary, str(metric_labels.get(primary) or primary_metric_label(platform, primary)) if primary else None
+
+
+def normalize_post_metrics(platform: str, payload: dict) -> tuple[dict, str | None, str | None]:
+    """Preserve native metrics; Home explicitly counts X impressions separately."""
+    if "post_metrics" in payload:
+        raw = payload.get("post_metrics") or {}
+    elif any(key.startswith("profile_snapshot") for key in payload):
+        raw = {}
+    else:
+        raw = payload  # Older saved post responses were flat.
+    raw = raw if isinstance(raw, dict) else {}
+
+    def read(*keys: str) -> int | float | None:
+        for key in keys:
+            value = _number(raw.get(key))
+            if value is not None and value >= 0:
+                return value
+        return None
+
+    keys = ("views", "video_views", "view_count")
+    if platform == "tiktok":
+        keys += ("play_count",)
+    views = read(*keys)
+    impressions = read("impressions", "impression_count")
+    primary = "impressions" if platform == "x" else "views"
+    value = impressions if platform == "x" else views
+    return {
+        "views": views,
+        "impressions": impressions,
+        "exposure": value,  # Compatibility for older post-detail clients only.
+        "reach": read("reach"),
+        "likes": read("likes", "like_count"),
+        "comments": read("comments", "comment_count", *(("replies", "reply_count") if platform == "x" else ())),
+        "shares": read("shares", "share_count", *(("reposts", "retweet_count") if platform == "x" else ())),
+        "saves": read("saves", "saved", "favorites", "favorite_count"),
+    }, primary if value is not None else None, primary_metric_label(platform, primary) if value is not None else None
+
+
+def analytics_failure_reason(message: str | None) -> str:
+    # A generic 404/not-found response is ambiguous: private posts and expired
+    # permissions can look identical to deletion. Only explicit statements count.
+    message = (message or "").lower().strip().rstrip(".")
+    if message in {
+        "post has been deleted", "video has been deleted", "media has been deleted",
+        "the post has been deleted", "the video has been deleted", "the media has been deleted",
+        "post deleted", "video deleted", "media deleted",
+    }:
+        return "deleted"
+    if any(word in message for word in ("not found", "does not exist", "unsupported get request")):
+        return "inaccessible"
+    if any(word in message for word in ("token", "permission", "unauthorized", "reconnect")):
+        return "connection"
+    return "temporary"
 
 
 def platform_payload(payload: dict, platform: str) -> dict:
@@ -264,6 +320,7 @@ async def _sync_period_snapshots(
     connected_platforms: list[str],
     profile_payloads: dict[str, dict],
     facebook_page_id: str | None,
+    since: datetime | None = None,
 ) -> None:
     """Persist exact date-window responses instead of reconstructing history from lifetime counters."""
 
@@ -278,6 +335,10 @@ async def _sync_period_snapshots(
     facebook_series = _timeseries(facebook_history, facebook_series_key)
 
     for period_days in (7, 30, 90):
+        if since and await db.scalar(select(AnalyticsPeriodSnapshot.id).where(
+            AnalyticsPeriodSnapshot.user_id == user.id, AnalyticsPeriodSnapshot.period_days == period_days,
+            AnalyticsPeriodSnapshot.captured_at >= since).limit(1)):
+            continue
         current_start = today - timedelta(days=period_days - 1)
         previous_end = current_start - timedelta(days=1)
         previous_start = previous_end - timedelta(days=period_days - 1)
@@ -418,18 +479,27 @@ async def _sync_period_snapshots(
         )
 
 
-async def sync_user_analytics(db: AsyncSession, user: User, *, force: bool = False) -> None:
+async def sync_user_analytics(db: AsyncSession, user: User, *, force: bool = False, since: datetime | None = None) -> None:
     client = UploadPostClient()
     connections = list(
         await db.scalars(
             select(SocialConnection).where(
                 SocialConnection.user_id == user.id,
                 SocialConnection.status == "connected",
+                SocialConnection.platform.in_(["instagram", "tiktok", "youtube", "facebook"]),
             )
         )
     )
     profile_payloads: dict[str, dict] = {}
     for connection in connections:
+        if since:
+            saved = await db.scalar(select(AccountAnalyticsSnapshot).where(
+                AccountAnalyticsSnapshot.user_id == user.id, AccountAnalyticsSnapshot.platform == connection.platform,
+                AccountAnalyticsSnapshot.captured_at >= since).order_by(AccountAnalyticsSnapshot.captured_at.desc()).limit(1))
+            if saved:
+                if saved.provider_status == "available":
+                    profile_payloads[connection.platform] = saved.raw_metrics or {}
+                continue
         try:
             profile_data = await client.profile_analytics(
                 user.upload_post_profile,
@@ -482,9 +552,10 @@ async def sync_user_analytics(db: AsyncSession, user: User, *, force: bool = Fal
             ),
             None,
         ),
+        since=since,
     )
+    await db.commit()
 
-    cutoff = utcnow() - timedelta(days=90)
     publications = list(
         await db.scalars(
             select(Publication)
@@ -492,12 +563,17 @@ async def sync_user_analytics(db: AsyncSession, user: User, *, force: bool = Fal
             .where(
                 Post.user_id == user.id,
                 Publication.status == "published",
-                Publication.published_at >= cutoff,
+                Publication.platform.in_(ANALYTICS_PLATFORMS),
+                Publication.published_at <= utcnow(),
+                Publication.analytics_hidden_at.is_(None),
             )
         )
     )
     for publication in publications:
-        age = utcnow() - publication.published_at
+        published_at = publication.published_at
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=UTC)
+        age = utcnow() - published_at
         latest_capture = await db.scalar(
             select(func.max(PublicationMetricSnapshot.captured_at)).where(
                 PublicationMetricSnapshot.publication_id == publication.id
@@ -505,6 +581,8 @@ async def sync_user_analytics(db: AsyncSession, user: User, *, force: bool = Fal
         )
         if latest_capture and latest_capture.tzinfo is None:
             latest_capture = latest_capture.replace(tzinfo=UTC)
+        if since and latest_capture and latest_capture >= since:
+            continue
         interval = timedelta(hours=23) if age <= timedelta(days=30) else timedelta(days=6)
         if not force and (age < timedelta(hours=1) or (latest_capture and utcnow() - latest_capture < interval)):
             continue
@@ -518,7 +596,7 @@ async def sync_user_analytics(db: AsyncSession, user: User, *, force: bool = Fal
             raw = platform_payload(raw_response, publication.platform)
             if error := provider_payload_error(raw):
                 raise ProviderError("analytics_unavailable", error)
-            normalized, metric, label = normalize_metrics(publication.platform, raw)
+            normalized, metric, label = normalize_post_metrics(publication.platform, raw)
             db.add(
                 PublicationMetricSnapshot(
                     publication_id=publication.id,
@@ -530,15 +608,20 @@ async def sync_user_analytics(db: AsyncSession, user: User, *, force: bool = Fal
                 )
             )
         except ProviderError as exc:
+            reason = analytics_failure_reason(str(exc))
+            if reason == "deleted" and publication.analytics_hidden_at is None:
+                publication.analytics_hidden_at = utcnow()
+                publication.analytics_hidden_reason = "deleted"
             db.add(
                 PublicationMetricSnapshot(
                     publication_id=publication.id,
-                    raw_metrics={},
+                    raw_metrics={"_refresh_failure": {"status": exc.status_code, "code": exc.code}},
                     normalized_metrics={},
                     provider_status="unavailable",
                     error_message=str(exc),
                 )
             )
+        await db.commit()
     await db.commit()
 
 
@@ -982,17 +1065,21 @@ def snapshot_result(publication: Publication, latest: PublicationMetricSnapshot 
                     successful: PublicationMetricSnapshot | None) -> dict:
     source = successful or latest
     metrics = None
-    primary = source.primary_metric if source else None
-    label = primary_metric_label(publication.platform, primary)
+    primary = label = None
     if source:
-        metrics = {key: _number(value) for key, value in (source.normalized_metrics or {}).items()}
-        # Correct historical fallback labels too; do not require a provider call.
-        if isinstance(source.raw_metrics.get("post_metrics"), dict):
-            metrics, primary, label = normalize_metrics(publication.platform, source.raw_metrics)
-        elif source.raw_metrics:
-            normalized, raw_primary, raw_label = normalize_metrics(publication.platform, source.raw_metrics)
-            if raw_primary:
-                metrics, primary, label = normalized, raw_primary, raw_label
+        if source.raw_metrics:
+            metrics, primary, label = normalize_post_metrics(publication.platform, source.raw_metrics)
+        else:
+            # Legacy rows can reuse exposure only when its original metric was
+            # genuinely views. Reach-based snapshots must never become views.
+            raw = dict(source.normalized_metrics or {})
+            if source.primary_metric in {"views", "video_views", "view_count"} or (
+                publication.platform == "tiktok" and source.primary_metric == "play_count"
+            ):
+                raw.setdefault("views", raw.get("exposure"))
+            if publication.platform == "x" and source.primary_metric in {"impressions", "impression_count"}:
+                raw.setdefault("impressions", raw.get("exposure"))
+            metrics, primary, label = normalize_post_metrics(publication.platform, raw)
     return {
         "platform": publication.platform,
         "metrics": metrics,
@@ -1003,12 +1090,57 @@ def snapshot_result(publication: Publication, latest: PublicationMetricSnapshot 
         "stale": bool(latest and successful and latest.id != successful.id),
         "error": latest.error_message if latest else None,
         "last_attempt_at": latest.captured_at if latest else None,
+        "failure_reason": analytics_failure_reason(latest.error_message) if latest and latest.provider_status != "available" else None,
     }
+
+
+def summary_metric(platform: str) -> str:
+    return "impressions" if platform == "x" else "views"
+
+
+def usable_view_result(publication: Publication, latest: PublicationMetricSnapshot | None,
+                       successful: PublicationMetricSnapshot | None = None) -> dict | None:
+    """Retain last valid counts unless hidden or explicitly confirmed deleted."""
+    if publication.analytics_hidden_at is not None or not latest:
+        return None
+    if latest.provider_status != "available" and analytics_failure_reason(latest.error_message) == "deleted":
+        return None
+    metric = summary_metric(publication.platform)
+    if latest.provider_status == "available":
+        result = snapshot_result(publication, latest, latest)
+        if (result["metrics"] or {}).get(metric) is not None:
+            return result  # Accept legitimate corrections, including lower counts and zero.
+    if successful is None:
+        return None
+    result = snapshot_result(publication, latest, successful)
+    return result if (result["metrics"] or {}).get(metric) is not None else None
 
 
 async def latest_publication_snapshots(db: AsyncSession, ids: list[str], *, successful: bool = False) -> dict:
     if not ids:
         return {}
+    if successful:
+        # A provider can return HTTP success without a usable metric. Walk saved
+        # successes newest-first so such responses never erase an older reading.
+        query = (select(PublicationMetricSnapshot, Publication)
+                 .join(Publication, Publication.id == PublicationMetricSnapshot.publication_id)
+                 .where(PublicationMetricSnapshot.publication_id.in_(ids),
+                        PublicationMetricSnapshot.provider_status == "available")
+                 .order_by(PublicationMetricSnapshot.captured_at.desc(), PublicationMetricSnapshot.id.desc()))
+        rows = await db.stream(query.execution_options(yield_per=500))
+        result = {}
+        try:
+            async for snapshot, publication in rows:
+                if publication.id in result:
+                    continue
+                metrics = snapshot_result(publication, snapshot, snapshot)["metrics"] or {}
+                if metrics.get(summary_metric(publication.platform)) is not None:
+                    result[publication.id] = snapshot
+                if len(result) == len(ids):
+                    break
+        finally:
+            await rows.close()
+        return result
     ranked = select(
         PublicationMetricSnapshot.id,
         func.row_number().over(
@@ -1016,8 +1148,6 @@ async def latest_publication_snapshots(db: AsyncSession, ids: list[str], *, succ
             order_by=(PublicationMetricSnapshot.captured_at.desc(), PublicationMetricSnapshot.id.desc()),
         ).label("position"),
     ).where(PublicationMetricSnapshot.publication_id.in_(ids))
-    if successful:
-        ranked = ranked.where(PublicationMetricSnapshot.provider_status == "available")
     ranked = ranked.subquery()
     snapshots = await db.scalars(
         select(PublicationMetricSnapshot).join(ranked, ranked.c.id == PublicationMetricSnapshot.id)
@@ -1035,12 +1165,101 @@ async def refresh_available_at(db: AsyncSession, user_id: str) -> datetime | Non
     return latest.replace(tzinfo=UTC) + timedelta(minutes=15) if latest.tzinfo is None else latest + timedelta(minutes=15)
 
 
+class AnalyticsVisibilityInput(BaseModel):
+    hidden: bool
+
+
+@router.patch("/publications/{publication_id}/visibility")
+async def set_analytics_visibility(
+    publication_id: str, body: AnalyticsVisibilityInput,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    await require_capability(db, user, "analytics")
+    publication = await db.scalar(
+        select(Publication).join(Post).where(
+            Publication.id == publication_id, Post.user_id == user.id,
+            Publication.status == "published", Publication.platform.in_(ANALYTICS_PLATFORMS),
+        )
+    )
+    if not publication:
+        raise HTTPException(status_code=404, detail={"code": "post_not_found", "message": "Post not found"})
+    if body.hidden:
+        if publication.analytics_hidden_at is None:
+            publication.analytics_hidden_at = utcnow()
+            publication.analytics_hidden_reason = "user"
+    else:
+        publication.analytics_hidden_at = None
+        publication.analytics_hidden_reason = None
+    await db.commit()
+    from .events import publish_realtime_event
+    await publish_realtime_event(user.id, "analytics.updated")
+    return {"publication_id": publication.id, "hidden_at": publication.analytics_hidden_at,
+            "hidden_reason": publication.analytics_hidden_reason}
+
+
+@router.get("/summary")
+async def view_summary(
+    period: Literal["all", "7d", "30d", "90d"] = "all",
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """Latest lifetime views; Home uses all publications, Insights keeps its filters.
+
+    Visible publications contribute video views, or post impressions for X.
+    No account snapshots, date-range totals, or repeated captures are added.
+    """
+    await require_capability(db, user, "analytics")
+    end = utcnow()
+    start = None if period == "all" else end - timedelta(days=int(period[:-1]))
+    publications = list(await db.scalars(
+        select(Publication).join(Post).where(
+            Post.user_id == user.id, Publication.status == "published",
+            Publication.platform.in_(ANALYTICS_PLATFORMS),
+            *([Publication.published_at >= start] if start is not None else []),
+            Publication.published_at <= end,
+        ).options(selectinload(Publication.post))
+    ))
+    ids = [publication.id for publication in publications]
+    latest = await latest_publication_snapshots(db, ids)
+    successful = await latest_publication_snapshots(db, ids, successful=True)
+    per_platform: dict[str, float] = defaultdict(float)
+    per_post: dict[str, float] = defaultdict(float)
+    titles = {}
+    captures = []
+    reporting = stale = 0
+    for publication in publications:
+        result = usable_view_result(publication, latest.get(publication.id), successful.get(publication.id))
+        if result is None:
+            continue
+        value = result["metrics"][summary_metric(publication.platform)]
+        reporting += 1
+        stale += int(result["stale"])
+        per_platform[publication.platform] += value
+        per_post[publication.post_id] += value
+        titles[publication.post_id] = publication.post.title or publication.post.caption[:80] or "Untitled post"
+        if result["captured_at"]:
+            captures.append(result["captured_at"])
+    top = max(per_post, key=per_post.get) if per_post else None
+    return {
+        "period": period, "published_from": start, "published_until": end,
+        "total_views": sum(per_platform.values()) if reporting else None,
+        "platforms": [{"platform": platform, "views": value} for platform, value in sorted(per_platform.items())],
+        "top_post": {"id": top, "title": titles[top], "views": per_post[top]} if top else None,
+        "publication_count": reporting, "reporting_count": reporting,
+        "missing_count": 0, "stale_count": stale,
+        "hidden_count": 0,
+        "oldest_capture_at": min(captures) if captures else None,
+        "latest_capture_at": max(captures) if captures else None,
+        "supported_platforms": ANALYTICS_PLATFORMS,
+    }
+
+
 @router.get("/posts")
 async def list_post_performance(
-    platform: Literal["instagram", "tiktok", "youtube", "facebook"] = "instagram",
+    platform: Literal["instagram", "tiktok", "youtube", "facebook", "x", "linkedin"] = "instagram",
     period: Literal["7d", "30d", "90d"] = "30d",
     limit: int = Query(default=20, ge=1, le=50),
     cursor: str | None = Query(default=None, max_length=1500),
+    hidden: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1058,7 +1277,7 @@ async def list_post_performance(
         try:
             data = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
             if (data["user"] != user.id or data["platform"] != platform or data["period"] != period
-                    or data["v"] != 1):
+                    or data["v"] != 3 or data["hidden"] != hidden):
                 raise ValueError("Cursor belongs to a different query")
             window_end = datetime.fromisoformat(data["end"])
             before = datetime.fromisoformat(data["before"])
@@ -1073,24 +1292,35 @@ async def list_post_performance(
         select(Publication).join(Post, Publication.post_id == Post.id)
         .where(Post.user_id == user.id, Publication.platform == platform,
                Publication.status == "published", Publication.published_at >= start,
-               Publication.published_at <= window_end)
-        .options(selectinload(Publication.post).selectinload(Post.media))
-        .order_by(Publication.published_at.desc(), Publication.id.desc()).limit(limit + 1)
+               Publication.published_at <= window_end,
+               Publication.analytics_hidden_at.is_not(None) if hidden else Publication.analytics_hidden_at.is_(None))
+        .order_by(Publication.published_at.desc(), Publication.id.desc())
     )
     if before:
         query = query.where(or_(Publication.published_at < before,
                                 and_(Publication.published_at == before, Publication.id < before_id)))
     rows = list(await db.scalars(query))
-    has_more = len(rows) > limit
-    rows = rows[:limit]
     ids = [row.id for row in rows]
     latest = await latest_publication_snapshots(db, ids)
     successful = await latest_publication_snapshots(db, ids, successful=True)
+    # Filter before pagination so unavailable rows cannot leave empty pages or
+    # hide valid posts later in the publication window.
+    if not hidden:
+        rows = [row for row in rows if usable_view_result(row, latest.get(row.id), successful.get(row.id)) is not None]
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    if rows:
+        # Hydrate captions and media only for the final visible page.
+        await db.scalars(select(Publication).where(Publication.id.in_([row.id for row in rows]))
+                         .options(selectinload(Publication.post).selectinload(Post.media)))
     from .media_routes import media_out
     items = []
     for publication in rows:
         post = publication.post
         items.append({
+            "publication_id": publication.id,
+            "hidden_at": publication.analytics_hidden_at,
+            "hidden_reason": publication.analytics_hidden_reason,
             "post_id": post.id,
             "title": publication.submitted_title if publication.submitted_title is not None else post.title,
             "caption": publication.submitted_caption if publication.submitted_caption is not None else post.caption,
@@ -1098,7 +1328,7 @@ async def list_post_performance(
             "duration_seconds": post.media.duration_seconds,
             "published_at": publication.published_at,
             "url": publication.url,
-            "analytics": snapshot_result(publication, latest.get(publication.id), successful.get(publication.id)),
+            "analytics": snapshot_result(publication, latest.get(publication.id), successful.get(publication.id)) if hidden else usable_view_result(publication, latest.get(publication.id), successful.get(publication.id)),
         })
     next_cursor = None
     if has_more:
@@ -1107,10 +1337,10 @@ async def list_post_performance(
         if published.tzinfo is None:
             published = published.replace(tzinfo=UTC)
         next_cursor = base64.urlsafe_b64encode(json.dumps({
-            "v": 1, "user": user.id, "platform": platform, "period": period,
+            "v": 3, "hidden": hidden, "user": user.id, "platform": platform, "period": period,
             "end": window_end.isoformat(), "before": published.isoformat(), "id": last.id,
         }).encode()).decode().rstrip("=")
-    return {"items": items, "next_cursor": next_cursor, "platform": platform, "period": period,
+    return {"items": items, "next_cursor": next_cursor, "platform": platform, "period": period, "hidden": hidden,
             "refresh_available_at": await refresh_available_at(db, user.id)}
 
 
@@ -1133,18 +1363,17 @@ async def get_post_analytics(post_id: str, user: User = Depends(get_current_user
         )
         latest = snapshots[0] if snapshots else None
         successful = next(
-            (item for item in snapshots if item.provider_status == "available"),
+            (item for item in snapshots if item.provider_status == "available"
+             and (snapshot_result(publication, item, item)["metrics"] or {}).get(summary_metric(publication.platform)) is not None),
             None,
         )
-        history = [
-            {
-                "captured_at": snapshot.captured_at,
-                "exposure": _number((snapshot.normalized_metrics or {}).get("exposure")),
-            }
-            for snapshot in reversed(snapshots)
-            if snapshot.provider_status == "available"
-            and _number((snapshot.normalized_metrics or {}).get("exposure")) is not None
-        ]
+        history = []
+        for snapshot in reversed(snapshots):
+            if snapshot.provider_status != "available":
+                continue
+            value = (snapshot_result(publication, snapshot, snapshot)["metrics"] or {}).get("views")
+            if value is not None:
+                history.append({"captured_at": snapshot.captured_at, "views": value, "exposure": value})
         items.append({**snapshot_result(publication, latest, successful), "history": history})
     return {"post_id": post.id, "items": items}
 
@@ -1160,8 +1389,9 @@ async def refresh_analytics(user: User = Depends(get_current_user), db: AsyncSes
         if remaining.total_seconds() > 0:
             raise HTTPException(status_code=429, detail={"code": "analytics_refresh_cooldown", "message": "Analytics can be refreshed once every 15 minutes", "retry_after_seconds": int(remaining.total_seconds())})
     try:
-        from .tasks import sync_analytics
-        sync_analytics.delay(user.id, True)
-    except CeleryError as exc:
+        from .analytics_runtime import enqueue_analytics
+        queued = enqueue_analytics(user.id, True)
+    except (CeleryError, RedisError) as exc:
         raise HTTPException(status_code=503, detail={"code": "analytics_queue_unavailable", "message": "Analytics refresh is temporarily unavailable"}) from exc
-    return {"message": "Analytics refresh started", "refresh_available_at": utcnow() + timedelta(minutes=15)}
+    return {"message": "Analytics refresh queued" if queued else "Refresh already queued or up to date",
+            "refresh_available_at": utcnow() + timedelta(minutes=15)}

@@ -16,6 +16,7 @@ from .config import get_settings
 from .database import get_db
 from .deps import get_current_user
 from .email import send_password_reset_email, send_verification_email
+from .entitlements import start_trial
 from .models import AuthSession, OneTimeToken, User
 from .schemas import AuthResponse, EmailIn, LoginIn, MessageOut, PasswordResetIn, RegisterIn, TokenIn, UserOut
 from .security import (
@@ -207,6 +208,7 @@ async def me(user: User = Depends(get_current_user)):
 async def verify_email(payload: TokenIn, db: AsyncSession = Depends(get_db)):
     user = await consume_one_time_token(db, payload.token, "verify_email")
     user.email_verified = True
+    start_trial(user)
     await db.commit()
     return user_out(user)
 
@@ -348,6 +350,7 @@ async def google_callback(
             raise HTTPException(status_code=409, detail={"code": "referral_signup_only", "message": "Referral codes can only be used when creating a new account"})
         user.google_sub = profile["sub"]
         user.email_verified = user.email_verified or bool(profile.get("email_verified"))
+    start_trial(user)
     await db.commit()
     exchange = await create_one_time_token(db, user, "oauth_exchange", 5)
     await db.commit()

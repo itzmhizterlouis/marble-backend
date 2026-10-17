@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 
+from .ai_adjustments import style_instructions
 from .config import get_settings
 
 
@@ -50,6 +51,8 @@ CANDIDATE_SCHEMA = {
             "maxItems": 20,
             "items": {"type": "string", "maxLength": 100},
         },
+        "x_caption": {"type": "string", "maxLength": 280},
+        "linkedin_caption": {"type": "string", "maxLength": 3000},
         "tiktok_caption": {"type": "string", "maxLength": 2200},
         "instagram_caption": {"type": "string", "maxLength": 2200},
         "facebook_title": {"type": "string", "maxLength": 255},
@@ -60,6 +63,8 @@ CANDIDATE_SCHEMA = {
     "required": [
         "shared_caption",
         "hashtags",
+        "x_caption",
+        "linkedin_caption",
         "tiktok_caption",
         "instagram_caption",
         "facebook_title",
@@ -153,9 +158,10 @@ class GeminiClient:
                 yield chunk
 
     async def upload_file(self, path: Path, mime_type: str) -> dict:
-        start_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={self.settings.gemini_api_key}"
+        start_url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
         size = path.stat().st_size
         headers = {
+            "x-goog-api-key": self.settings.gemini_api_key,
             "X-Goog-Upload-Protocol": "resumable",
             "X-Goog-Upload-Command": "start",
             "X-Goog-Upload-Header-Content-Length": str(size),
@@ -203,7 +209,8 @@ class GeminiClient:
                 await asyncio.sleep(2)
                 try:
                     file_response = await client.get(
-                        f"https://generativelanguage.googleapis.com/v1beta/{file['name']}?key={self.settings.gemini_api_key}"
+                        f"https://generativelanguage.googleapis.com/v1beta/{file['name']}",
+                        headers={"x-goog-api-key": self.settings.gemini_api_key},
                     )
                 except httpx.RequestError as exc:
                     raise _request_error(exc, "processing") from exc
@@ -218,7 +225,8 @@ class GeminiClient:
     async def delete_file(self, name: str) -> None:
         async with httpx.AsyncClient(timeout=20) as client:
             await client.delete(
-                f"https://generativelanguage.googleapis.com/v1beta/{name}?key={self.settings.gemini_api_key}"
+                f"https://generativelanguage.googleapis.com/v1beta/{name}",
+                headers={"x-goog-api-key": self.settings.gemini_api_key},
             )
 
     async def _generate_json(
@@ -228,10 +236,12 @@ class GeminiClient:
         *,
         temperature: float,
         invalid_message: str,
+        timeout: float = 180,
+        stage: str = "gemini_generation",
     ) -> tuple[dict, dict]:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.settings.gemini_model}:generateContent?key={self.settings.gemini_api_key}"
+            f"{self.settings.gemini_model}:generateContent"
         )
         payload = {
             "contents": [{"role": "user", "parts": parts}],
@@ -241,10 +251,13 @@ class GeminiClient:
                 "temperature": temperature,
             },
         }
-        self._stage("gemini_generation")
-        async with httpx.AsyncClient(timeout=180) as client:
+        self._stage(stage)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             try:
-                response = await client.post(url, json=payload)
+                async with asyncio.timeout(timeout):
+                    response = await client.post(url, json=payload, headers={"x-goog-api-key": self.settings.gemini_api_key})
+            except TimeoutError as exc:
+                raise GeminiError("Gemini took too long to respond. Please try again.", code="gemini_generation_timeout") from exc
             except httpx.RequestError as exc:
                 raise _request_error(exc, "generation") from exc
         if response.is_error:
@@ -266,6 +279,7 @@ class GeminiClient:
             CANDIDATE_SCHEMA,
             temperature=0.7,
             invalid_message="AI returned an invalid draft",
+            timeout=30,
         )
         if not all(key in candidate for key in CANDIDATE_SCHEMA["required"]):
             raise GeminiError("AI returned an incomplete draft")
@@ -301,6 +315,7 @@ class GeminiClient:
         hashtags: list[str],
         platforms: list[str],
         generation_context: str = "",
+        adjustments: list[str] | None = None,
     ) -> tuple[dict, dict | None, dict]:
         context_instruction = (
             f"Creator-provided additional context (use as guidance, preserve the facts, and do not invent details): "
@@ -315,11 +330,16 @@ class GeminiClient:
             "accurate, engaging social copy grounded in those observations and the creator's context. "
             f"Selected platforms: {', '.join(platforms)}. Existing caption: {current_caption!r}. "
             f"Existing hashtags: {', '.join(hashtags)}. {context_instruction} "
+            f"{style_instructions(adjustments)}"
             "Keep each platform's conventions. Every caption and description field must contain body text only: "
             "do not embed hashtags in those fields. Put hashtags only in the hashtags array, without a leading # "
             "and without spaces. Keep YouTube title within 100 characters, Facebook title within 255, TikTok and "
             "Instagram captions within 2200, and YouTube description within 5000 UTF-8 bytes after hashtags are "
-            "appended. Use an empty string for an unselected platform. Return only the schema."
+            "appended. For X, write one concise thought, aiming for at most 160 weighted characters of body text. "
+            "Reverb selects up to two hashtags within a separate 60-character budget for X. "
+            "The final X post must fit 280 weighted characters; CJK and emoji weigh two. "
+            "LinkedIn commentary must fit 3000 UTF-16 units including hashtags. Avoid links in X copy. "
+            "Use an empty string for an unselected platform. Return only the schema."
         )
         result, usage = await self._generate_json(
             [
@@ -343,7 +363,7 @@ class GeminiClient:
     async def adjust_candidate(
         self,
         candidate: dict,
-        adjustment: str,
+        adjustment: str | list[str],
         generation_context: str = "",
         *,
         video_observations: dict | None = None,
@@ -361,16 +381,34 @@ class GeminiClient:
             f"Video observations: {json.dumps(video_observations, ensure_ascii=False)}. "
             if video_observations else "Do not add new factual claims not present in the previous copy or creator context. "
         )
-        variation_instruction = (
-            "Create a genuinely different version of the wording and opening, not just a small edit. "
-            if adjustment == "regenerate" else f"Apply the '{adjustment}' adjustment. "
-        )
+        variation_instruction = style_instructions(adjustment)
         prompt = (
             f"Rewrite this social content. {variation_instruction}{observation_instruction}"
             f"Selected platforms: {', '.join(platforms or [])}. Use an empty string for unselected platforms. "
             "Preserve the facts and return every field. "
             "Keep hashtags only in the hashtags array without # characters or spaces; captions must contain body "
-            "text only. Preserve all platform limits. "
+            "text only. Preserve all platform limits. For X, aim for at most 160 weighted characters of body text; "
+            "Reverb will select up to two hashtags within a separate 60-character budget. "
             f"{context_instruction} Candidate JSON: {json.dumps(candidate, ensure_ascii=False)}"
         )
         return await self._generate([{"text": prompt}])
+
+    async def repair_copy(self, captions: dict[str, str], limits: dict[str, dict]) -> tuple[dict, dict]:
+        """One text-only repair, retaining all other generated fields."""
+        schema = {
+            "type": "object",
+            "properties": {field: {"type": "string"} for field in captions},
+            "required": list(captions),
+        }
+        prompt = (
+            "Shorten only the supplied captions into complete, natural thoughts. Preserve their meaning; "
+            "do not invent facts. Do not include hashtags, links, explanations or alternatives. "
+            "max_words is a HARD word limit. max_units is a HARD X weighted-character budget for body text "
+            "only; space for hashtags is already reserved. Emoji and CJK characters weigh two. "
+            "Aim comfortably below every limit. "
+            f"Limits: {json.dumps(limits)}. Captions: {json.dumps(captions, ensure_ascii=False)}"
+        )
+        return await self._generate_json(
+            [{"text": prompt}], schema, temperature=0.3, invalid_message="AI returned an invalid revision",
+            timeout=10, stage="gemini_repair",
+        )

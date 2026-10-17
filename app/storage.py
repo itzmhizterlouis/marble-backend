@@ -105,6 +105,16 @@ class R2Storage:
 
         return await asyncio.to_thread(generate)
 
+    async def presign_download(self, key: str) -> str:
+        def generate() -> str:
+            try:
+                return self.client.generate_presigned_url(
+                    "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=3600,
+                )
+            except (BotoCoreError, ClientError, OSError, ValueError) as exc:
+                raise StorageError() from exc
+        return await asyncio.to_thread(generate)
+
     async def list_parts(self, key: str, upload_id: str) -> list[StoredPart]:
         parts: list[StoredPart] = []
         marker: int | None = None

@@ -4,11 +4,12 @@ from datetime import UTC, datetime, timedelta
 
 from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from .ai_adjustments import ADJUSTMENTS, adjustment_choices
 from .config import get_settings
 from .database import get_db
 from .deps import get_current_user
@@ -16,12 +17,20 @@ from .entitlements import require_capability
 from .models import AIGenerationJob, AIUsageCounter, FeatureFlag, Post, User
 
 router = APIRouter(prefix="/v1/ai", tags=["ai"])
-ADJUSTMENTS = {"shorter", "more_engaging", "professional", "casual", "regenerate"}
 
 
 class GenerateIn(BaseModel):
     post_id: str
     generation_context: str = Field(default="", max_length=2000)
+    adjustments: list[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("adjustments")
+    @classmethod
+    def clean_styles(cls, value: list[str]) -> list[str]:
+        choices = adjustment_choices(value)
+        if any(choice not in ADJUSTMENTS - {"regenerate", "retry_x"} for choice in choices):
+            raise ValueError("Choose supported caption styles")
+        return choices
 
     @field_validator("generation_context")
     @classmethod
@@ -30,8 +39,21 @@ class GenerateIn(BaseModel):
 
 
 class AdjustIn(BaseModel):
-    adjustment: str = Field(min_length=3, max_length=32)
+    adjustment: str | None = Field(default=None, min_length=3, max_length=32)
+    adjustments: list[str] | None = Field(default=None, min_length=1, max_length=4)
     generation_context: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_choices(self):
+        if (self.adjustment is None) == (self.adjustments is None):
+            raise ValueError("Provide either adjustment or adjustments")
+        choices = adjustment_choices(self.adjustments or self.adjustment)
+        if not choices or any(choice not in ADJUSTMENTS for choice in choices):
+            raise ValueError("Choose supported adjustments")
+        if ({"regenerate", "retry_x"} & set(choices)) and len(choices) > 1:
+            raise ValueError("Retry X and Try another version must be requested separately")
+        self.adjustments = choices
+        return self
 
     @field_validator("generation_context")
     @classmethod
@@ -47,6 +69,7 @@ def job_out(job: AIGenerationJob) -> dict:
         "parent_job_id": job.parent_job_id,
         "kind": job.kind,
         "adjustment": job.adjustment,
+        "adjustments": job.adjustments or adjustment_choices(job.adjustment),
         "generation_context": job.generation_context or "",
         "status": job.status,
         "model": job.model,
@@ -139,6 +162,7 @@ async def create_generation(payload: GenerateIn, user: User = Depends(get_curren
         post_id=post.id,
         media_id=post.media_id,
         kind="video",
+        adjustments=payload.adjustments,
         generation_context=payload.generation_context,
         status="queued",
         model=get_settings().gemini_model,
@@ -160,6 +184,7 @@ async def create_generation(payload: GenerateIn, user: User = Depends(get_curren
 @router.get("/generations/latest")
 async def get_latest_generation(
     post_id: str = Query(min_length=1),
+    completed_only: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -175,6 +200,7 @@ async def get_latest_generation(
             AIGenerationJob.post_id == post_id,
             AIGenerationJob.user_id == user.id,
             AIGenerationJob.media_id == current_media_id,
+            AIGenerationJob.status == "completed" if completed_only else True,
         )
         .order_by(AIGenerationJob.created_at.desc(), AIGenerationJob.id.desc())
     )
@@ -194,9 +220,7 @@ async def get_generation(job_id: str, user: User = Depends(get_current_user), db
 async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await require_capability(db, user, "ai_creation")
     await ensure_ai_available(db)
-    adjustment = payload.adjustment.casefold().replace(" ", "_")
-    if adjustment not in ADJUSTMENTS:
-        raise HTTPException(status_code=422, detail={"code": "invalid_adjustment", "message": "Choose a supported adjustment"})
+    choices = payload.adjustments
     parent = await db.scalar(select(AIGenerationJob).where(AIGenerationJob.id == job_id, AIGenerationJob.user_id == user.id))
     if not parent or parent.status != "completed" or not parent.candidate:
         raise HTTPException(status_code=409, detail={"code": "ai_candidate_not_ready", "message": "Wait for the current suggestion to finish"})
@@ -219,7 +243,12 @@ async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends
         raise HTTPException(status_code=409, detail={"code": "media_not_ready", "message": "Finish processing the video first"})
     if not current_post.versions:
         raise HTTPException(status_code=422, detail={"code": "platform_required", "message": "Choose at least one platform first"})
-    if adjustment == "regenerate" and not parent.video_observations:
+    if "retry_x" in choices and (
+        not any(version.platform == "x" for version in current_post.versions)
+        or not parent.candidate.get("platform_errors", {}).get("x")
+    ):
+        raise HTTPException(status_code=409, detail={"code": "ai_x_retry_unavailable", "message": "No failed X caption to retry"})
+    if "regenerate" in choices and not parent.video_observations:
         raise HTTPException(
             status_code=409,
             detail={
@@ -234,8 +263,9 @@ async def adjust_generation(job_id: str, payload: AdjustIn, user: User = Depends
         media_id=parent.media_id,
         parent_job_id=parent.id,
         kind="adjustment",
-        adjustment=adjustment,
-        generation_context=parent.generation_context if payload.generation_context is None else payload.generation_context,
+        adjustment=choices[0] if len(choices) == 1 else None,
+        adjustments=choices,
+        generation_context=parent.generation_context if "retry_x" in choices or payload.generation_context is None else payload.generation_context,
         video_observations=parent.video_observations,
         status="queued",
         model=get_settings().gemini_model,

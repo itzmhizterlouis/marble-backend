@@ -1,6 +1,8 @@
 import hashlib
 import hmac
 import time
+from email import policy
+from email.parser import BytesParser
 
 import pytest
 import respx
@@ -49,7 +51,7 @@ async def test_connection_manager_is_branded_and_limited_to_one_platform(monkeyp
     for expected in (
         '"platforms":["instagram"]',
         '"show_calendar":false',
-        '"logo_image":"https://marble.example/assets/reverb-logo.png"',
+        '"logo_image":"https://marble.example/assets/reverb-logo-v2.jpg"',
         '"redirect_button_text":"Return to Reverb"',
         "Upload-Post",
     ):
@@ -103,6 +105,109 @@ async def test_scheduled_submission_contains_all_platform_versions(monkeypatch, 
     assert b'name="youtube_title"\r\n\r\nVideo title\r\n' in body
     assert b'name="youtube_description"\r\n\r\nYouTube copy\r\n' in body
     assert b"tiktok" not in body
+
+
+@pytest.mark.parametrize("scheduled", [False, True], ids=["immediate", "scheduled"])
+@pytest.mark.parametrize("customized", [False, True], ids=["shared-copy", "custom-copy"])
+@pytest.mark.parametrize(
+    "platforms",
+    [
+        ("tiktok", "youtube", "instagram"),
+        ("youtube", "instagram", "tiktok"),
+        ("facebook", "tiktok", "youtube", "instagram"),
+    ],
+)
+@respx.mock
+async def test_mixed_upload_preserves_full_caption_fallback(
+    monkeypatch, tmp_path, scheduled, customized, platforms
+):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.post("https://provider.test/api/upload").mock(
+        return_value=Response(200, json={"request_id": "mixed-request", "job_id": "mixed-job"})
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    shared = "The complete caption keeps its line breaks, emoji 🎬 and ending.\n" * 5 + "#Reverb"
+    captions = {
+        platform: f"{platform}: {shared}\n{platform} ends here" if customized else shared
+        for platform in platforms
+    }
+    titles = {"youtube": "A short YouTube title", "facebook": "A short Facebook title"}
+    scheduled_at = "2026-12-01T11:00:00+00:00" if scheduled else None
+
+    await UploadPostClient().publish_video(
+        profile="marble_creator",
+        video_path=video,
+        post_id="mixed-post",
+        revision=2,
+        versions=[
+            {"platform": platform, "caption": captions[platform], "title": titles.get(platform)}
+            for platform in platforms
+        ],
+        scheduled_at=scheduled_at,
+        timezone="Africa/Lagos" if scheduled else None,
+        facebook_page_id="page-1" if "facebook" in platforms else None,
+    )
+
+    assert route.call_count == 1
+    request = route.calls.last.request
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {request.headers['content-type']}\r\nMIME-Version: 1.0\r\n\r\n".encode()
+        + request.content
+    )
+    fields = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name != "video":
+            fields.setdefault(name, []).append(part.get_payload(decode=True).decode())
+
+    fallback_platform = next(platform for platform in platforms if platform != "youtube")
+    assert len(captions[fallback_platform]) > 100
+    assert fields["title"] == [captions[fallback_platform]]
+    assert fields["youtube_title"] == [titles["youtube"]]
+    assert fields["youtube_description"] == [captions["youtube"]]
+    assert fields["tiktok_title"] == [captions["tiktok"]]
+    assert fields["instagram_title"] == [captions["instagram"]]
+    assert fields["platform[]"] == list(platforms)
+    if "facebook" in platforms:
+        assert fields["facebook_title"] == [titles["facebook"]]
+        assert fields["facebook_description"] == [captions["facebook"]]
+    if scheduled:
+        assert fields["scheduled_date"] == [scheduled_at]
+        assert fields["timezone"] == ["Africa/Lagos"]
+    else:
+        assert "scheduled_date" not in fields
+        assert "timezone" not in fields
+    assert request.headers["idempotency-key"] == "marble:mixed-post:2"
+
+
+@respx.mock
+async def test_youtube_only_keeps_short_title_and_full_description(monkeypatch, tmp_path):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(settings, "upload_post_base_url", "https://provider.test/api")
+    route = respx.post("https://provider.test/api/upload").mock(
+        return_value=Response(200, json={"request_id": "youtube-request"})
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    caption = "Full YouTube description. " * 20
+    await UploadPostClient().publish_video(
+        profile="marble_creator",
+        video_path=video,
+        post_id="youtube-post",
+        revision=1,
+        versions=[{"platform": "youtube", "caption": caption, "title": "Short title"}],
+        scheduled_at=None,
+        timezone=None,
+        facebook_page_id=None,
+    )
+    body = route.calls.last.request.content
+    assert b'name="title"\r\n\r\nShort title\r\n' in body
+    assert b'name="youtube_title"\r\n\r\nShort title\r\n' in body
+    assert f'name="youtube_description"\r\n\r\n{caption}\r\n'.encode() in body
 
 
 async def test_youtube_submission_requires_an_explicit_title(tmp_path):
@@ -268,3 +373,43 @@ async def test_total_exposure_uses_exact_dates_platforms_and_metrics(monkeypatch
     assert params["metrics"] == "likes,comments,shares"
     assert params["platform"] == "instagram,youtube"
     assert "period" not in params
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+@pytest.mark.parametrize("platforms", [("x",), ("linkedin",), ("x", "linkedin", "youtube")])
+@respx.mock
+async def test_x_linkedin_video_fields_preserve_per_platform_copy(monkeypatch, tmp_path, scheduled, platforms):
+    monkeypatch.setattr(get_settings(), "upload_post_api_key", "test-key")
+    monkeypatch.setattr(get_settings(), "upload_post_base_url", "https://provider.test/api")
+    route = respx.post("https://provider.test/api/upload").mock(return_value=Response(200, json={"request_id": "new-platforms"}))
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    captions = {"x": "Short X copy #video", "linkedin": "Full LinkedIn commentary. " * 50, "youtube": "YouTube description"}
+    await UploadPostClient().publish_video(
+        profile="creator", video_path=video, post_id="post", revision=1,
+        versions=[{"platform": p, "caption": captions[p], "title": "YouTube title" if p == "youtube" else None} for p in platforms],
+        scheduled_at="2026-12-01T12:00:00Z" if scheduled else None, timezone="Africa/Lagos", facebook_page_id=None,
+    )
+    body = route.calls.last.request.content.decode()
+    for platform in platforms:
+        assert captions[platform] in body
+    if "linkedin" in platforms:
+        assert 'name="linkedin_description"\r\n\r\n' + captions["linkedin"] in body
+        assert 'name="linkedin_title"\r\n\r\nVideo\r\n' in body
+    if "x" in platforms:
+        assert 'name="x_title"\r\n\r\n' + captions["x"] in body
+        assert 'name="x_long_text_as_post"\r\n\r\nfalse\r\n' in body
+    assert ('name="scheduled_date"' in body) is scheduled
+
+
+@respx.mock
+async def test_upload_history_is_scoped_to_post_and_platform(monkeypatch):
+    monkeypatch.setattr(get_settings(), "upload_post_api_key", "provider-test-key")
+    monkeypatch.setattr(get_settings(), "upload_post_base_url", "https://provider.test/api")
+    route = respx.get("https://provider.test/api/uploadposts/history", params={
+        "external_id": "reverb-post", "platform": "facebook", "limit": 100,
+    }).mock(return_value=Response(200, json={"history": [], "in_progress": []}))
+    assert await UploadPostClient().upload_history(external_id="reverb-post", platform="facebook") == {
+        "history": [], "in_progress": [],
+    }
+    assert route.call_count == 1

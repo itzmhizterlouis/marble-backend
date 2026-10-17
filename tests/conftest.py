@@ -20,3 +20,15 @@ from app.main import app  # noqa: E402
 def client():
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def isolate_analytics_rate_store(monkeypatch, request):
+    # Ordinary provider tests exercise HTTP payloads. Dedicated runtime tests use
+    # a disposable real Redis instance to check cross-client coordination.
+    if request.node.get_closest_marker("analytics_redis"):
+        return
+    async def no_wait():
+        pass
+    monkeypatch.setattr("app.analytics_runtime.pace_analytics", no_wait)
+    monkeypatch.setattr("app.analytics_runtime.observe_analytics_limits", lambda response: None)

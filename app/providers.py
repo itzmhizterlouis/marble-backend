@@ -37,6 +37,10 @@ class UploadPostClient:
         return {"Authorization": f"Apikey {self.settings.upload_post_api_key}", **extra}
 
     async def _json(self, method: str, path: str, **kwargs) -> dict:
+        analytics_request = path.startswith(("/analytics/", "/uploadposts/post-analytics", "/uploadposts/total-impressions"))
+        if analytics_request:
+            from .analytics_runtime import pace_analytics
+            await pace_analytics()
         try:
             async with httpx.AsyncClient(base_url=self.settings.upload_post_base_url, timeout=40) as client:
                 response = await client.request(
@@ -44,6 +48,9 @@ class UploadPostClient:
                 )
         except httpx.HTTPError as exc:
             raise ProviderError("provider_unavailable", "Upload-Post is temporarily unavailable", 503) from exc
+        if analytics_request:
+            from .analytics_runtime import observe_analytics_limits
+            observe_analytics_limits(response)
         if response.is_error:
             try:
                 body = response.json()
@@ -60,6 +67,9 @@ class UploadPostClient:
     async def create_profile(self, username: str) -> dict:
         return await self._json("POST", "/uploadposts/users", json={"username": username})
 
+    async def delete_profile(self, username: str) -> dict:
+        return await self._json("DELETE", "/uploadposts/users", json={"username": username})
+
     async def get_profile(self, username: str) -> dict:
         return await self._json("GET", f"/uploadposts/users/{username}")
 
@@ -72,7 +82,7 @@ class UploadPostClient:
                 "redirect_url": redirect_url,
                 "platforms": [platform],
                 "show_calendar": False,
-                "logo_image": f"{self.settings.frontend_url}/assets/reverb-logo.png",
+                "logo_image": f"{self.settings.frontend_url}/assets/reverb-logo-v2.jpg",
                 "redirect_button_text": "Return to Reverb",
                 "connect_title": f"Connect {platform.title()} to Reverb",
                 "connect_description": (
@@ -96,25 +106,15 @@ class UploadPostClient:
 
     @staticmethod
     def _generic_upload_title(versions: list[dict], youtube_title: str) -> str:
-        """Return a safe Upload-Post fallback title for mixed-platform uploads."""
+        """Preserve a full caption in Upload-Post's shared fallback field."""
         if len(versions) == 1:
             return youtube_title
-        facebook = next(
-            (version for version in versions if version.get("platform") == "facebook"),
-            None,
-        )
-        if facebook:
-            facebook_fallback = str(
-                facebook.get("title") or facebook.get("caption") or ""
-            ).strip()
-            if facebook_fallback:
-                return facebook_fallback[:100]
         for version in versions:
             if version.get("platform") == "youtube":
                 continue
             caption = str(version.get("caption") or "").strip()
             if caption:
-                return caption[:100]
+                return caption
         return youtube_title
 
     async def publish_video(
@@ -143,10 +143,10 @@ class UploadPostClient:
         }
         if youtube:
             # Upload-Post requires a generic title when YouTube is selected,
-            # but that field is a fallback for every destination. In a mixed
-            # upload, use a non-YouTube caption as the fallback so the explicit
-            # YouTube title cannot become another platform's caption. The
-            # platform-specific fields below remain authoritative.
+            # but it can also become another destination's caption. Preserve
+            # the complete fallback: the 100-character YouTube title limit
+            # belongs to youtube_title, not to this shared caption. Keep each
+            # platform's explicit title/description below for customized copy.
             data["title"] = self._generic_upload_title(versions, youtube_title)
         request_id = request_id or upload_request_id(post_id, revision)
         data["request_id"] = request_id
@@ -155,6 +155,13 @@ class UploadPostClient:
             if platform == "youtube":
                 data["youtube_title"] = youtube_title
                 data["youtube_description"] = version["caption"]
+            elif platform == "linkedin":
+                # Full post copy belongs in commentary, not the 400-unit media title.
+                data["linkedin_description"] = version["caption"]
+                data["linkedin_title"] = "Video"
+            elif platform == "x":
+                data["x_title"] = version["caption"]
+                data["x_long_text_as_post"] = "false"
             elif platform == "facebook":
                 if version.get("title"):
                     data["facebook_title"] = version["title"]
@@ -201,6 +208,11 @@ class UploadPostClient:
     async def status(self, *, request_id: str | None = None, job_id: str | None = None) -> dict:
         params = {"request_id": request_id} if request_id else {"job_id": job_id}
         return await self._json("GET", "/uploadposts/status", params=params)
+
+    async def upload_history(self, *, external_id: str, platform: str) -> dict:
+        return await self._json("GET", "/uploadposts/history", params={
+            "external_id": external_id, "platform": platform, "limit": 100,
+        })
 
     async def retry(
         self,

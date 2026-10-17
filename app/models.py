@@ -46,6 +46,9 @@ class User(Base, TimestampMixin):
     referral_code: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True, index=True)
     referred_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     first_paid_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The trial end this creator was last reminded about; a restarted trial earns a new reminder.
+    trial_reminder_sent_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     sessions: Mapped[list[AuthSession]] = relationship(back_populates="user", cascade="all, delete-orphan")
     connections: Mapped[list[SocialConnection]] = relationship(
@@ -152,12 +155,33 @@ class MediaUploadPart(Base, TimestampMixin):
     media: Mapped[MediaAsset] = relationship(back_populates="upload_parts")
 
 
+class SubtitleJob(Base, TimestampMixin):
+    __tablename__ = "subtitle_jobs"
+    __table_args__ = (UniqueConstraint("media_id", "fingerprint", name="uq_subtitle_media_fingerprint"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    media_id: Mapped[str] = mapped_column(ForeignKey("media_assets.id", ondelete="CASCADE"), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    words: Mapped[list] = mapped_column(JSON, default=list)
+    run_token: Mapped[str] = mapped_column(String(36), default=new_id)
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    storage_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class Post(Base, TimestampMixin):
     __tablename__ = "posts"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     media_id: Mapped[str] = mapped_column(ForeignKey("media_assets.id", ondelete="RESTRICT"), index=True)
+    subtitle_job_id: Mapped[str | None] = mapped_column(ForeignKey("subtitle_jobs.id", ondelete="RESTRICT"), nullable=True)
     title: Mapped[str] = mapped_column(String(255), default="")
     caption: Mapped[str] = mapped_column(Text, default="")
     hashtags: Mapped[list] = mapped_column(JSON, default=list)
@@ -220,6 +244,8 @@ class Publication(Base, TimestampMixin):
     submitted_caption: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     submitted_hashtags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    analytics_hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    analytics_hidden_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)
 
     post: Mapped[Post] = relationship(back_populates="publications")
     provider_attempts: Mapped[list[PublicationAttempt]] = relationship(
@@ -549,6 +575,7 @@ class AIGenerationJob(Base, TimestampMixin):
     )
     kind: Mapped[str] = mapped_column(String(24), default="video")
     adjustment: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    adjustments: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     generation_context: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
     model: Mapped[str] = mapped_column(String(80))

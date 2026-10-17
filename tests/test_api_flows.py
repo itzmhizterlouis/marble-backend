@@ -5,12 +5,13 @@ import json
 import time
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import Text, select, update
 from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 from app.database import SessionLocal, task_engine
-from app.models import MediaAsset, Post, Publication, SocialConnection, User
+from app.models import MediaAsset, Post, PostNotification, Publication, SocialConnection, User
 from app.providers import UploadPostClient
 from app.storage import StoredPart
 from app.tasks import _process_media, _reconcile_active, _retry_platform
@@ -711,14 +712,15 @@ def test_retryable_provider_result_stays_active_without_posting_again(client, mo
     assert publication["error_message"] is None
 
 
-def test_confirmed_single_failure_uses_provider_retry(client, monkeypatch):
-    email = "provider-retry@example.com"
+@pytest.mark.parametrize(("platform", "youtube_overflow"), [("instagram", False), ("x", False), ("linkedin", False), ("youtube", True)])
+def test_confirmed_single_failure_uses_provider_retry(client, monkeypatch, youtube_overflow, platform):
+    email = f"provider-retry-{platform}@example.com"
     auth = register(client, email)
     headers = {"Authorization": f"Bearer {auth['access_token']}"}
-    asyncio.run(verify_and_connect(email, platforms=("instagram",)))
+    asyncio.run(verify_and_connect(email, platforms=(platform,)))
     media = client.post(
         "/v1/media",
-        json={"filename": "provider-retry.mp4", "mime_type": "video/mp4", "size_bytes": 8},
+        json={"filename": "provider-retry.mp4", "mime_type": "video/mp4", "size_bytes": 100000},
         headers=headers,
     ).json()
     asyncio.run(mark_media_ready(media["id"]))
@@ -727,7 +729,7 @@ def test_confirmed_single_failure_uses_provider_retry(client, monkeypatch):
         json={
             "media_id": media["id"],
             "caption": "Use original request",
-            "versions": [{"platform": "instagram", "caption": "Use original request"}],
+            "versions": [{"platform": platform, "caption": "Use original request", "title": "Valid title"}],
         },
         headers=headers,
     ).json()
@@ -747,12 +749,17 @@ def test_confirmed_single_failure_uses_provider_retry(client, monkeypatch):
             )
             publication.status = "failed"
             publication.provider_request_id = "failed-instagram-request"
+            if youtube_overflow:
+                # An old submitted snapshot must be checked even when the
+                # current draft is valid. Provider retry reuses that snapshot.
+                publication.submitted_caption = " ".join(["#repeat"] * 60)
+                publication.submitted_title = "Title #one"
             await db.commit()
 
     asyncio.run(mark_failed())
     monkeypatch.setattr("app.posts.retry_platform.delay", lambda *_args, **_kwargs: None)
     queued = client.post(
-        f"/v1/posts/{draft['id']}/publications/instagram/retry", headers=headers
+        f"/v1/posts/{draft['id']}/publications/{platform}/retry", headers=headers
     )
     assert queued.status_code == 202
 
@@ -762,7 +769,7 @@ def test_confirmed_single_failure_uses_provider_retry(client, monkeypatch):
             "status": "failed",
             "results": [
                 {
-                    "platform": "instagram",
+                    "platform": platform,
                     "status": "failed",
                     "success": False,
                     "error": "Provider failed",
@@ -782,11 +789,57 @@ def test_confirmed_single_failure_uses_provider_retry(client, monkeypatch):
     monkeypatch.setattr(UploadPostClient, "status", remote_status)
     monkeypatch.setattr(UploadPostClient, "retry", provider_retry)
     monkeypatch.setattr(UploadPostClient, "publish_video", must_not_upload)
-    asyncio.run(_retry_platform(draft["id"], "instagram"))
+    asyncio.run(_retry_platform(draft["id"], platform))
 
-    assert retried["request_id"] == "failed-instagram-request"
     completed = client.get(f"/v1/posts/{draft['id']}", headers=headers).json()
-    assert completed["publications"][0]["status"] == "queued"
+    if youtube_overflow:
+        assert retried == {}
+        assert completed["publications"][0]["status"] == "failed"
+        assert completed["publications"][0]["error_code"] == "content_validation_failed"
+        assert "61 hashtags" in completed["publications"][0]["error_message"]
+        # This suite shares its database. Keep this test's failure notification
+        # from being delivered by the notification tests later in the run.
+        async def cancel_test_notification():
+            async with SessionLocal() as db:
+                await db.execute(
+                    update(PostNotification)
+                    .where(PostNotification.post_id == draft["id"])
+                    .values(status="cancelled")
+                )
+                await db.commit()
+
+        asyncio.run(cancel_test_notification())
+    else:
+        assert retried["request_id"] == "failed-instagram-request"
+        assert completed["publications"][0]["status"] == "queued"
+
+
+@pytest.mark.parametrize("mode", ["now", "scheduled"])
+def test_publish_blocks_combined_youtube_hashtags_before_queueing(client, monkeypatch, mode):
+    email = f"hashtag-{mode}@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=("youtube",)))
+    media = client.post("/v1/media", headers=headers, json={
+        "filename": "hashtags.mp4", "mime_type": "video/mp4", "size_bytes": 8,
+    }).json()
+    asyncio.run(mark_media_ready(media["id"]))
+    draft = client.post("/v1/posts", headers=headers, json={
+        "media_id": media["id"], "content_format_version": 2,
+        "caption": " ".join(["#repeat"] * 59), "hashtags": ["field"],
+        "versions": [{"platform": "youtube", "title": "Title #one", "use_shared_caption": True}],
+    })
+    assert draft.status_code == 201
+    queued = []
+    monkeypatch.setattr("app.posts.publish_post.delay", lambda post_id: queued.append(post_id))
+    payload = {"mode": mode}
+    if mode == "scheduled":
+        payload.update(scheduled_at=(datetime.now(UTC) + timedelta(minutes=20)).isoformat(), timezone="Africa/Lagos")
+    result = client.post(f"/v1/posts/{draft.json()['id']}/publish", headers=headers, json=payload)
+    assert result.status_code == 422
+    assert "61 hashtags" in result.json()["field_errors"]["versions.youtube.caption"]
+    assert queued == []
+    assert client.get(f"/v1/posts/{draft.json()['id']}", headers=headers).json()["status"] == "draft"
 
 
 def test_shared_schedule_creation_and_publish_validation(client, monkeypatch):
@@ -1065,3 +1118,281 @@ def test_started_post_cannot_be_deleted(client, monkeypatch):
     response = client.delete(f"/v1/posts/{draft['id']}", headers=headers)
     assert response.status_code == 409
     assert response.json()["code"] == "post_publishing"
+
+
+@pytest.mark.parametrize("platform", ["x", "linkedin"])
+def test_new_platform_connect_and_sync(client, monkeypatch, platform):
+    email = f"new-connection-{platform}@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=()))
+    pinned = True
+    async def profile(_self, _username):
+        return {"profile": {"social_accounts": {platform: {"username": "member", "display_name": "Personal Name"}}, "linkedin_page_id": "urn:li:organization:123" if pinned else None, "linkedin_page_name": "Our Company" if pinned else None}}
+    async def connect(_self, _username, target, redirect_url):
+        assert target == platform
+        assert redirect_url.endswith(f"connect_platform={platform}")
+        return "https://app.upload-post.com/connect?token=test"
+    monkeypatch.setattr(UploadPostClient, "get_profile", profile)
+    monkeypatch.setattr(UploadPostClient, "connection_access_url", connect)
+    assert client.post(f"/v1/connections/{platform}/authorize", headers=headers).status_code == 200
+    assert client.post(f"/v1/connections/{platform}/manage", headers=headers).status_code == 200
+    response = client.post("/v1/connections/sync", headers=headers)
+    assert response.status_code == 200
+    item = next(a for a in response.json() if a["platform"] == platform)
+    assert item["status"] == "connected"
+    if platform == "linkedin":
+        assert item["target_page_id"] == "urn:li:organization:123"
+        assert item["display_name"] == "Our Company"
+        pinned = False
+        response = client.post("/v1/connections/sync", headers=headers)
+        item = next(a for a in response.json() if a["platform"] == platform)
+        assert item["target_page_id"] is None
+        assert item["display_name"] == "Personal Name"
+
+
+@pytest.mark.parametrize("mode", ["now", "scheduled"])
+@pytest.mark.parametrize("platform", ["x", "linkedin"])
+def test_new_video_destinations_publish_and_reject_bad_copy(client, monkeypatch, mode, platform):
+    email = f"video-{platform}-{mode}@example.com"
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=(platform,)))
+    media = client.post("/v1/media", headers=headers, json={"filename": "clip.mp4", "mime_type": "video/mp4", "size_bytes": 100000}).json()
+    asyncio.run(mark_media_ready(media["id"]))
+    if platform == "x":
+        async def oversized_video():
+            async with SessionLocal() as db:
+                asset = await db.get(MediaAsset, media["id"])
+                asset.width, asset.height = 2160, 3840
+                await db.commit()
+        asyncio.run(oversized_video())
+    data = {"media_id": media["id"], "caption": "a" * (281 if platform == "x" else 3001), "hashtags": [], "content_format_version": 2, "versions": [{"platform": platform, "use_shared_caption": True}]}
+    draft = client.post("/v1/posts", headers=headers, json=data)
+    assert draft.status_code == 201
+    post_id = draft.json()["id"]
+    queued = []
+    monkeypatch.setattr("app.posts.publish_post.delay", lambda p: queued.append(p))
+    payload = {"mode": mode}
+    if mode == "scheduled":
+        payload.update(scheduled_at=(datetime.now(UTC) + timedelta(minutes=20)).isoformat(), timezone="Africa/Lagos")
+    response = client.post(f"/v1/posts/{post_id}/publish", headers=headers, json=payload)
+    assert response.status_code == 422
+    assert queued == []
+    data["caption"] = "Valid caption #video"
+    if platform == "x":
+        data["hashtags"] = [f"LongTag{i}" + "a" * 40 for i in range(10)]
+        data["versions"][0]["options"] = {
+            "ai_hashtags": [data["hashtags"][0]], "ai_hashtags_source": data["hashtags"],
+        }
+    assert client.patch(f"/v1/posts/{post_id}", headers=headers, json=data).status_code == 200
+    response = client.post(f"/v1/posts/{post_id}/publish", headers=headers, json=payload)
+    assert response.status_code == 202, response.text
+    assert queued == [post_id]
+
+
+@pytest.fixture(autouse=True)
+def empty_upload_history(monkeypatch):
+    async def history(_self, **_kwargs):
+        return {"history": [], "in_progress": []}
+    monkeypatch.setattr(UploadPostClient, "upload_history", history)
+
+
+def retry_fixture(client, monkeypatch, suffix):
+    email = f"retry-regression-{suffix}@example.com".lower()
+    auth = register(client, email)
+    headers = {"Authorization": f"Bearer {auth['access_token']}"}
+    asyncio.run(verify_and_connect(email, platforms=("facebook", "youtube")))
+    media = client.post("/v1/media", headers=headers, json={
+        "filename": "retry.mp4", "mime_type": "video/mp4", "size_bytes": 8,
+    }).json()
+    asyncio.run(mark_media_ready(media["id"]))
+    post = client.post("/v1/posts", headers=headers, json={
+        "media_id": media["id"], "caption": "Retry safely",
+        "versions": [{"platform": p, "caption": "Retry safely", "title": "Retry safely"} for p in ("facebook", "youtube")],
+    }).json()
+    monkeypatch.setattr("app.posts.publish_post.delay", lambda *_: None)
+    assert client.post(f"/v1/posts/{post['id']}/publish", headers=headers, json={"mode": "now"}).status_code == 202
+
+    async def seed():
+        async with SessionLocal() as db:
+            obj = await db.get(Post, post['id'])
+            obj.status = "partially_published"
+            obj.provider_request_id, obj.provider_job_id = f"old-request-{obj.id}", f"old-job-{obj.id}"
+            rows = (await db.scalars(select(Publication).where(Publication.post_id == obj.id))).all()
+            for row in rows:
+                row.provider_request_id, row.provider_job_id = f"old-request-{obj.id}", f"old-job-{obj.id}"
+                row.status = "failed" if row.platform == "facebook" else "published"
+            await db.commit()
+    asyncio.run(seed())
+    monkeypatch.setattr("app.posts.retry_platform.delay", lambda *_: None)
+    return post['id'], headers
+
+
+async def publication_state(post_id):
+    from app.models import PublicationAttempt
+    async with SessionLocal() as db:
+        row = await db.scalar(select(Publication).where(Publication.post_id == post_id, Publication.platform == "facebook"))
+        attempts = (await db.scalars(select(PublicationAttempt).where(PublicationAttempt.publication_id == row.id))).all()
+        return {"status": row.status, "request_id": row.provider_request_id, "job_id": row.provider_job_id,
+                "post_id": row.provider_post_id, "url": row.url,
+                "attempts": [(a.provider_request_id, a.provider_job_id) for a in attempts]}
+
+
+@pytest.mark.parametrize("new_request,new_job", [("new-request", None), ("new-request", "new-job"), (None, "job-only")])
+def test_retry_tracks_new_reference_and_ignores_old_failure(client, monkeypatch, new_request, new_job):
+    from app.tasks import _reconcile_post
+    post_id, headers = retry_fixture(client, monkeypatch, f"new-id-{new_job}")
+    calls = []
+
+    async def status(_self, **kwargs):
+        calls.append(kwargs)
+        new = kwargs['request_id'] == 'new-request' or kwargs['job_id'] == 'job-only'
+        return {"request_id": kwargs['request_id'], "results": [{
+            "platform": "facebook", "success": new,
+            "platform_post_id": "123" if new else None,
+            "post_url": "https://www.facebook.com/reel/123" if new else None,
+            "error_message": None if new else "No Facebook Page",
+        }]}
+
+    async def retry(_self, **kwargs):
+        return {"success": True, "request_id": new_request, "job_id": new_job}
+    monkeypatch.setattr(UploadPostClient, 'status', status)
+    monkeypatch.setattr(UploadPostClient, 'retry', retry)
+    assert client.post(f'/v1/posts/{post_id}/publications/facebook/retry', headers=headers).status_code == 202
+    # Beat can run before the queued worker; it must not resurrect the old failure.
+    asyncio.run(_reconcile_post(post_id))
+    assert calls == []
+    asyncio.run(_retry_platform(post_id, 'facebook'))
+    saved = asyncio.run(publication_state(post_id))
+    assert saved['request_id'] == new_request
+    assert saved['job_id'] == new_job
+    assert saved['attempts'] == [(new_request, new_job)]
+    asyncio.run(_reconcile_post(post_id))
+    assert calls[-1] == {'request_id': new_request, 'job_id': new_job}
+    saved = asyncio.run(publication_state(post_id))
+    assert saved['status'] == 'published'
+    assert saved['post_id'] == '123'
+    # A delayed failure callback from the original job cannot undo success.
+    secret = 'retry-regression-secret'
+    monkeypatch.setattr(get_settings(), 'upload_post_webhook_secret', secret)
+    body = json.dumps({'external_id': post_id, 'request_id': f'old-request-{post_id}', 'job_id': f'old-job-{post_id}',
+                       'platform': 'facebook', 'result': {'success': False, 'error': 'Old failure'}}).encode()
+    ts = str(int(time.time()))
+    signature = hmac.new(secret.encode(), ts.encode()+b'.'+body, hashlib.sha256).hexdigest()
+    assert client.post('/v1/webhooks/upload-post', content=body, headers={
+        'Content-Type':'application/json', 'X-Upload-Post-Timestamp':ts,
+        'X-Upload-Post-Signature':signature, 'X-Upload-Post-Delivery':f'old-failure-{post_id}',
+    }).status_code == 200
+    assert asyncio.run(publication_state(post_id))['status'] == 'published'
+    assert client.post(f'/v1/posts/{post_id}/publications/facebook/retry', headers=headers).status_code == 409
+
+
+@pytest.mark.parametrize('path', ['retry', 'reconcile', 'missing_status'])
+def test_history_recovers_lost_retry_without_reposting(client, monkeypatch, path):
+    from app.providers import ProviderError
+    from app.tasks import _reconcile_post
+    post_id, headers = retry_fixture(client, monkeypatch, f'history-{path}')
+
+    async def history(_self, **kwargs):
+        return {'history': [{'external_id': post_id, 'platform': 'facebook', 'success': True,
+                             'request_id': 'recovered-request', 'job_id': 'recovered-job',
+                             'platform_post_id': '456', 'post_url': 'https://www.facebook.com/reel/456'}]}
+    async def status(_self, **kwargs):
+        if path == 'missing_status':
+            raise ProviderError('provider_http_404', 'Not found', 404)
+        return {'request_id':f'old-request-{post_id}','results':[{'platform':'facebook','success':False}]}
+    async def no_upload(*args, **kwargs):
+        raise AssertionError('Already live: must not submit another upload')
+    monkeypatch.setattr(UploadPostClient, 'upload_history', history)
+    monkeypatch.setattr(UploadPostClient, 'status', status)
+    monkeypatch.setattr(UploadPostClient, 'retry', no_upload)
+    monkeypatch.setattr(UploadPostClient, 'publish_video', no_upload)
+    if path == 'retry':
+        client.post(f'/v1/posts/{post_id}/publications/facebook/retry', headers=headers)
+        asyncio.run(_retry_platform(post_id, 'facebook'))
+    else:
+        asyncio.run(_reconcile_post(post_id))
+    saved = asyncio.run(publication_state(post_id))
+    assert saved['status'] == 'published'
+    assert saved['request_id'] == 'recovered-request'
+    assert saved['job_id'] == 'recovered-job'
+    assert saved['post_id'] == '456'
+
+
+@pytest.mark.parametrize('history_mode', ['unavailable', 'in_progress'])
+def test_uncertain_history_never_posts_again(client, monkeypatch, history_mode):
+    from app.providers import ProviderError
+    post_id, headers = retry_fixture(client, monkeypatch, f'uncertain-{history_mode}')
+    async def history(_self, **kwargs):
+        if history_mode == 'unavailable':
+            raise ProviderError('provider_unavailable', 'Unavailable', 503)
+        return {'history': [], 'in_progress': [{'external_id':post_id}]}
+    async def no_upload(*args, **kwargs):
+        raise AssertionError('Cannot safely retry while the result is unknown')
+    monkeypatch.setattr(UploadPostClient, 'upload_history', history)
+    monkeypatch.setattr(UploadPostClient, 'retry', no_upload)
+    monkeypatch.setattr(UploadPostClient, 'publish_video', no_upload)
+    client.post(f'/v1/posts/{post_id}/publications/facebook/retry', headers=headers)
+    asyncio.run(_retry_platform(post_id, 'facebook'))
+    assert asyncio.run(publication_state(post_id))['status'] == 'publishing'
+    assert client.post(f'/v1/posts/{post_id}/publications/facebook/retry', headers=headers).status_code == 409
+
+
+def test_current_failure_webhook_is_verified_before_exposing_retry(client, monkeypatch):
+    from app.tasks import _reconcile_post
+    post_id, headers = retry_fixture(client, monkeypatch, 'webhook-verification')
+    secret = 'failure-verification-secret'
+    monkeypatch.setattr(get_settings(), 'upload_post_webhook_secret', secret)
+    body = json.dumps({'external_id':post_id, 'request_id':f'old-request-{post_id}', 'job_id':f'old-job-{post_id}',
+                       'platform':'facebook', 'result':{'success':False, 'error':'Failed'}}).encode()
+    ts = str(int(time.time()))
+    signature = hmac.new(secret.encode(), ts.encode()+b'.'+body, hashlib.sha256).hexdigest()
+    assert client.post('/v1/webhooks/upload-post', content=body, headers={
+        'Content-Type':'application/json', 'X-Upload-Post-Timestamp':ts,
+        'X-Upload-Post-Signature':signature, 'X-Upload-Post-Delivery':f'failure-{post_id}',
+    }).status_code == 200
+    assert asyncio.run(publication_state(post_id))['status'] == 'publishing'
+    assert client.post(f'/v1/posts/{post_id}/publications/facebook/retry', headers=headers).status_code == 409
+    async def status(_self, **kwargs):
+        return {'request_id':f'old-request-{post_id}','results':[{'platform':'facebook','success':False,'error_message':'Still failed'}]}
+    monkeypatch.setattr(UploadPostClient, 'status', status)
+    asyncio.run(_reconcile_post(post_id))
+    # No success or pending upload in history: the failure can now be shown.
+    assert asyncio.run(publication_state(post_id))['status'] == 'failed'
+    async def clean_notification():
+        async with SessionLocal() as db:
+            await db.execute(update(PostNotification).where(PostNotification.post_id == post_id).values(status='cancelled'))
+            await db.commit()
+    asyncio.run(clean_notification())
+
+
+async def test_stale_failure_does_not_demote_new_retry_or_clear_saved_post_id():
+    from types import SimpleNamespace
+
+    from app.tasks import apply_provider_payload
+    pub = SimpleNamespace(platform='facebook', status='queued', provider_request_id='new', provider_job_id='new-job',
+                          provider_post_id=None, url=None, error_code=None, error_message=None,
+                          fallback_to_inbox=False, published_at=None)
+    post = SimpleNamespace(publications=[pub], status='publishing', media=SimpleNamespace(delete_after=None))
+    await apply_provider_payload(post, {'request_id':'old','job_id':'old-job',
+                                      'results':[{'platform':'facebook','success':False}]})
+    assert pub.status == 'queued'
+    await apply_provider_payload(post, {'request_id':'new','job_id':'new-job',
+                                      'results':[{'platform':'facebook','success':True,'platform_post_id':'123'}]})
+    await apply_provider_payload(post, {'request_id':'new','results':[{'platform':'facebook','success':True}]})
+    assert pub.status == 'published'
+    assert pub.provider_post_id == '123'
+
+
+async def test_old_callback_cannot_cancel_a_retry_waiting_for_its_worker():
+    from types import SimpleNamespace
+
+    from app.tasks import apply_provider_payload
+    pub = SimpleNamespace(platform='facebook', status='queued', provider_request_id='old', provider_job_id='old-job',
+                          error_code='retry_pending')
+    post = SimpleNamespace(publications=[pub], status='publishing', media=SimpleNamespace(delete_after=None))
+    await apply_provider_payload(post, {'request_id':'old','job_id':'old-job',
+                                      'results':[{'platform':'facebook','success':False}]})
+    assert pub.status == 'queued'
+    assert pub.error_code == 'retry_pending'

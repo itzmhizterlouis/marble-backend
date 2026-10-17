@@ -13,7 +13,7 @@ from .providers import ProviderError, UploadPostClient
 from .schemas import AuthorizeOut, ConnectionOut, FacebookPageOut, FacebookPageSelection, MessageOut, Platform
 
 router = APIRouter(prefix="/v1/connections", tags=["connections"])
-PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
+PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook", "x", "linkedin")
 
 
 def _provider_text(value: object) -> str | None:
@@ -90,6 +90,7 @@ async def sync_connections(db: AsyncSession, user: User) -> list[SocialConnectio
             row.username = row.handle = row.display_name = row.avatar_url = None
             row.capabilities = []
             row.connected_at = None
+            row.target_page_id = None
             continue
         if isinstance(account, str):
             identifier = _provider_text(account)
@@ -121,6 +122,15 @@ async def sync_connections(db: AsyncSession, user: User) -> list[SocialConnectio
             row.capabilities = account.get("capabilities") or []
         if row.status in {"connected", "needs_selection"} and not row.connected_at:
             row.connected_at = now
+    linkedin = next((item for item in rows if item.platform == "linkedin"), None)
+    if linkedin and linkedin.status == "connected":
+        # Upload-Post's hosted manager owns personal-profile / company-Page
+        # selection. The pin takes precedence over any per-upload Page ID.
+        linkedin.target_page_id = _provider_identifier(profile.get("linkedin_page_id"))
+        if linkedin.target_page_id:
+            linkedin.display_name = _provider_text(profile.get("linkedin_page_name")) or "LinkedIn company Page"
+            linkedin.handle = None
+            linkedin.avatar_url = None
     facebook = next((item for item in rows if item.platform == "facebook"), None)
     if facebook and facebook.status == "connected":
         try:

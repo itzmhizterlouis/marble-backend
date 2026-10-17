@@ -17,7 +17,8 @@ cp .env.example .env
 Run the worker and scheduler separately during local development:
 
 ```bash
-.venv/bin/celery -A app.tasks.celery_app worker --loglevel=INFO
+.venv/bin/celery -A app.tasks.celery_app worker --loglevel=INFO -Q celery
+.venv/bin/celery -A app.tasks.celery_app worker --loglevel=INFO -Q subtitles --concurrency=1 --prefetch-multiplier=1 -n subtitles@%h
 .venv/bin/celery -A app.tasks.celery_app beat --loglevel=INFO
 ```
 
@@ -26,7 +27,7 @@ SQLite is the zero-setup development default. Use PostgreSQL in staging and prod
 ## External service setup
 
 - Upload-Post: set `UPLOAD_POST_API_KEY` and `UPLOAD_POST_WEBHOOK_SECRET`; configure the webhook URL as `https://<railway-host>/v1/webhooks/upload-post`.
-- Brevo: set `BREVO_API_KEY`, a verified `BREVO_SENDER_EMAIL`, and optionally `BREVO_SENDER_NAME`. Terminal publishing failures are delivered from a deduplicated background outbox; set `PUBLISH_FAILURE_EMAILS_ENABLED=false` only if you need to pause those alerts.
+- Brevo: set `BREVO_API_KEY`, a verified `BREVO_SENDER_EMAIL`, and optionally `BREVO_SENDER_NAME`. Terminal publishing failures are delivered from a deduplicated background outbox; set `PUBLISH_FAILURE_EMAILS_ENABLED=false` only if you need to pause those alerts. An hourly task emails creators about 24 hours before their 7-day Pro trial ends (once per trial); `TRIAL_REMINDER_EMAILS_ENABLED=false` pauses it.
 - Google: create a web OAuth client and add `https://<railway-host>/v1/auth/google/callback` as an authorized redirect URI.
 - Frontend: set `FRONTEND_URL` to the exact Vercel origin and `API_PUBLIC_URL` to the Railway origin.
 - R2: set `STORAGE_BACKEND=r2`, `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_REGION=auto`. The R2 token should be limited to Object Read & Write on this bucket only. Configure the private `reverb` bucket CORS for the exact `FRONTEND_URL`, `PUT`, the `Content-Type` request header, and the `ETag` exposed response header so browsers can complete signed parts. `R2_PRESIGN_TTL_SECONDS` controls signed-part expiry and `R2_MULTIPART_PART_SIZE_BYTES` must be at least 5 MiB.
@@ -40,7 +41,7 @@ R2 parts upload directly from the browser with bounded concurrency. Completing a
 
 ## Railway
 
-Create one Railway project containing this service, PostgreSQL, and Redis. Keep `STORAGE_ROOT=/data` for temporary FFmpeg/provider materialization and legacy local media. With `STORAGE_BACKEND=r2`, new source videos and thumbnails are stored in the private R2 bucket and the volume is only a processing/compatibility fallback. The container supervises FastAPI, one Celery worker, and Celery beat. Railway should provide `DATABASE_URL` and `REDIS_URL`; convert the database URL to the `postgresql+asyncpg://` scheme if needed.
+Create one Railway project containing this service, PostgreSQL, and Redis. Keep `STORAGE_ROOT=/data` for temporary FFmpeg/provider materialization and legacy local media. With `STORAGE_BACKEND=r2`, new source videos and thumbnails are stored in the private R2 bucket and the volume is only a processing/compatibility fallback. The container supervises FastAPI, the publishing Celery worker, a separate single-concurrency subtitles worker, and Celery beat. Railway should provide `DATABASE_URL` and `REDIS_URL`; convert the database URL to the `postgresql+asyncpg://` scheme if needed.
 
 Run `alembic upgrade head` as part of startup (already configured in `supervisord.conf`). Keep Upload-Post, Brevo, Google, JWT, and webhook secrets only in Railway variables.
 
@@ -56,7 +57,7 @@ Before enabling enforcement:
 4. Deploy the frontend and run an analytics backfill by activating Pro or invoking the analytics refresh worker.
 5. Set `BILLING_ENFORCEMENT_ENABLED=true` and redeploy the backend.
 
-Paystack, Gemini and Upload-Post secrets are backend-only. The frontend requires no new billing or AI secret variables. Upload-Post Professional currently limits this release to 25 creator profiles, so monitor provider capacity during the beta.
+Paystack, Gemini, Groq and Upload-Post secrets are backend-only. The frontend requires no new billing or AI secret variables. Upload-Post Professional currently limits this release to 25 creator profiles, so monitor provider capacity during the beta.
 
 ## Verification
 
@@ -66,3 +67,19 @@ Paystack, Gemini and Upload-Post secrets are backend-only. The frontend requires
 ```
 
 API errors consistently use `{ code, message, field_errors?, request_id }`. Swagger documentation is available at `/docs` outside any proxy path.
+
+## Auto subtitles
+
+Deploy migration `0018_auto_subtitles`. Set the backend-only `GROQ_API_KEY` (Groq Whisper Large V3 Turbo). `SUBTITLES_ENABLED=false` pauses new subtitle jobs; `SUBTITLES_DAILY_LIMIT` defaults to 20 render attempts per creator per rolling day, with at most two active jobs per creator. No frontend key is needed.
+
+The Docker image supplies FFmpeg/libass and Noto fonts. Local FFmpeg must include the `ass` filter. The dedicated `subtitles` queue keeps rendering out of the publishing worker; FFmpeg uses two encoding threads. For increased volume, move this queue to a separate Railway worker using the same database, Redis, R2 and Groq settings (disable the bundled subtitles supervisor program then).
+
+Jobs save word timing before rendering. Corrections create immutable video versions, and drafts explicitly select a version. Publishing waits for readiness; immediate posts, schedules and targeted retries resolve the same selection. A failed render can reuse its transcript. Preview URLs are signed; derived videos expire with their source media, while active schedules and subtitle jobs protect retention. Queue reconciliation recovers missed deliveries and exposes interrupted jobs for retry after 40 minutes. No customer audio, subtitle text or provider error bodies are logged.
+
+### Analytics refreshes
+
+Analytics runs on the dedicated `analytics` Celery queue (one worker process, prefetch 1); publishing stays on `celery`. All processes sharing an Upload-Post key use Redis request pacing (one analytics call per four seconds) and a shared cooldown from `Retry-After` / `X-RateLimit-Reset`. Requests pause before exhausting the reported general allowance. A 429 defers the job rather than recording failed metrics for every remaining post.
+
+Refreshes coalesce per creator, including delayed publication triggers, and completed refreshes have a 15-minute cooldown. Completed snapshots are committed and skipped on retries. Queue reservations survive worker restarts; an expiring execution lease prevents overlapping work during rolling deploys. Redis outages defer analytics instead of issuing unpaced requests.
+
+Home and Insights retain previously reported actual views during temporary refresh failures, with the original capture timestamp. Hidden/deleted posts, access failures, and posts without actual views remain excluded. No reach/impression values are substituted. Runtime coordination tests use a disposable local `redis-server` and never production Redis.

@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-Platform = Literal["tiktok", "instagram", "youtube", "facebook"]
+Platform = Literal["tiktok", "instagram", "youtube", "facebook", "x", "linkedin"]
 
 
 class UserOut(BaseModel):
@@ -141,6 +141,7 @@ class VersionIn(BaseModel):
 
 
 class PostUpsertIn(BaseModel):
+    subtitle_job_id: str | None = None
     media_id: str
     title: str = Field(default="", max_length=255)
     caption: str = Field(default="", max_length=63206)
@@ -187,6 +188,7 @@ class PublicationOut(BaseModel):
 
 
 class PostOut(BaseModel):
+    subtitle_job_id: str | None = None
     id: str
     media: MediaOut
     title: str

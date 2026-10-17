@@ -5,16 +5,21 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from .content import ContentValidationError, compile_and_validate, normalize_hashtags
+from .content import (
+    ContentValidationError,
+    compile_and_validate,
+    normalize_hashtags,
+    validate_video_platforms,
+)
 from .database import get_db
 from .deps import get_current_user, require_verified_user
 from .entitlements import (
     require_capability,
-    reserve_trial_publication,
     resolve_billing_access,
     upgrade_required,
 )
@@ -36,6 +41,8 @@ from .schemas import (
     ScheduleUpdateIn,
     VersionIn,
 )
+from .subtitle_routes import validate_subtitle_selection
+from .subtitles import selected_video
 from .tasks import derive_post_status, publish_post, retry_platform
 
 router = APIRouter(prefix="/v1/posts", tags=["posts"])
@@ -82,6 +89,7 @@ def validate_schedule(value: datetime | None, timezone: str | None) -> datetime:
 def post_out(post: Post) -> PostOut:
     return PostOut(
         id=post.id,
+        subtitle_job_id=post.subtitle_job_id,
         media=media_out(post.media),
         title=post.title,
         caption=post.caption,
@@ -174,9 +182,11 @@ def normalize_payload_hashtags(payload: PostUpsertIn | ScheduleUpdateIn) -> None
         ) from exc
 
 
-def validate_publish_input(payload: PostUpsertIn) -> None:
+def validate_publish_input(payload: PostUpsertIn, media: MediaAsset | None = None) -> None:
     versions = validate_versions(payload, for_publish=True)
     try:
+        if media is not None:
+            validate_video_platforms(media, [version.platform for version in versions])
         compile_and_validate(
             shared_caption=payload.caption,
             hashtags=payload.hashtags,
@@ -230,7 +240,9 @@ async def create_post(
             status_code=409,
             detail={"code": "media_failed", "message": "This video could not be processed"},
         )
+    await validate_subtitle_selection(db, user, media.id, payload.subtitle_job_id)
     post = Post(
+        subtitle_job_id=payload.subtitle_job_id,
         user_id=user.id,
         media_id=media.id,
         title=payload.title.strip(),
@@ -281,12 +293,31 @@ async def update_post(
                 detail={"code": "media_failed", "message": "This video could not be processed"},
             )
         post.media_id = media.id
+    await validate_subtitle_selection(db, user, payload.media_id, payload.subtitle_job_id)
+    post.subtitle_job_id = payload.subtitle_job_id
     post.title, post.caption, post.hashtags = payload.title.strip(), payload.caption.strip(), payload.hashtags
     post.content_format_version = payload.content_format_version
     post.status = "draft"
     await replace_versions(db, post, versions)
     await db.commit()
     return post_out(await owned_post(db, user, post.id))
+
+
+class SubtitleSelectionIn(BaseModel):
+    subtitle_job_id: str | None = None
+
+
+@router.patch("/{post_id}/subtitles", response_model=PostOut)
+async def select_subtitles(post_id: str, payload: SubtitleSelectionIn,
+                           user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)):
+    post = await owned_post(db, user, post_id, lock=True)
+    if post.status not in {"draft", "cancelled"}:
+        raise HTTPException(409, detail={"code": "post_locked", "message": "Subtitles can only change on a draft"})
+    await validate_subtitle_selection(db, user, post.media_id, payload.subtitle_job_id)
+    post.subtitle_job_id = payload.subtitle_job_id
+    await db.commit()
+    await publish_post_event(user.id, post.id)
+    return post_out(post)
 
 
 @router.get("", response_model=PostListOut)
@@ -333,7 +364,7 @@ async def publish(
     post = await owned_post(db, user, post_id, lock=True)
     access = await resolve_billing_access(db, user)
     if not access.capabilities["publish"] and access.trial_post_id != post.id:
-        raise upgrade_required("publish", message="Your one-post preview has been used. Choose a plan to continue")
+        raise upgrade_required("publish", message="Your free trial has ended. Choose a plan to continue")
     if payload.mode == "scheduled" and not access.capabilities["schedule"]:
         raise upgrade_required("schedule", message="Scheduling is available on Basic and Pro")
     if post.status not in {"draft", "cancelled", "failed"}:
@@ -360,7 +391,11 @@ async def publish(
                 for item in post.versions
             ],
     )
-    validate_publish_input(publish_input)
+    try:
+        video = await selected_video(db, post)
+    except ProviderError as exc:
+        raise HTTPException(exc.status_code, detail={"code": exc.code, "message": str(exc)}) from exc
+    validate_publish_input(publish_input, video)
     selected = {item.platform for item in post.versions}
     connections = list(
         await db.scalars(
@@ -375,17 +410,6 @@ async def publish(
         raise HTTPException(
             status_code=409,
             detail={"code": "accounts_not_connected", "message": f"Reconnect: {', '.join(missing)}"},
-        )
-    if access.tier == "trial":
-        await reserve_trial_publication(
-            db,
-            user,
-            post_id=post.id,
-            provider_account_ids=[
-                item.provider_account_id or f"{item.platform}:connected"
-                for item in connections
-                if item.platform in selected
-            ],
         )
     if payload.mode == "scheduled":
         post.scheduled_at_utc = validate_schedule(payload.scheduled_at, payload.timezone)
@@ -507,7 +531,11 @@ async def update_schedule(
                     else (post.content_format_version or 1)
                 ),
             )
-            validate_publish_input(next_input)
+            try:
+                video = await selected_video(db, post)
+            except ProviderError as exc:
+                raise HTTPException(exc.status_code, detail={"code": exc.code, "message": str(exc)}) from exc
+            validate_publish_input(next_input, video)
             await client.cancel_schedule(post.provider_job_id)
             if payload.title is not None:
                 post.title = payload.title.strip()
@@ -623,7 +651,8 @@ async def retry_publication(
             detail={"code": "publication_not_retryable", "message": "This destination does not need a retry"},
         )
     publication.status = "queued"
-    publication.error_code = publication.error_message = None
+    publication.error_code = "retry_pending"
+    publication.error_message = None
     post.status = "publishing"
     post.schedule_revision += 1
     await db.commit()

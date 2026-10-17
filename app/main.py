@@ -23,6 +23,7 @@ from .events import router as events_router
 from .media_routes import router as media_router
 from .posts import router as posts_router
 from .providers import ProviderError, UploadPostClient
+from .subtitle_routes import router as subtitle_router
 from .webhooks import router as webhooks_router
 
 settings = get_settings()
@@ -126,6 +127,7 @@ app.include_router(events_router)
 app.include_router(connections_router)
 app.include_router(media_router)
 app.include_router(posts_router)
+app.include_router(subtitle_router)
 app.include_router(webhooks_router)
 
 

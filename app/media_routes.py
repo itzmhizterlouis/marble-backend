@@ -625,6 +625,8 @@ async def delete_media(
         raise HTTPException(
             status_code=409, detail={"code": "media_in_use", "message": "Delete the post first"}
         )
+    from .subtitles import delete_subtitle_files
+    await delete_subtitle_files(db, asset)
     if asset.storage_backend == "r2":
         try:
             storage = R2Storage()

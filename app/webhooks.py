@@ -13,7 +13,7 @@ from .models import Post, Publication, PublicationAttempt, SocialConnection, Use
 from .notifications import queue_terminal_notification
 from .providers import verify_upload_post_signature
 from .schemas import MessageOut
-from .tasks import apply_provider_payload
+from .tasks import apply_provider_payload, derive_post_status
 
 router = APIRouter(prefix="/v1/webhooks", tags=["webhooks"])
 
@@ -122,9 +122,19 @@ async def upload_post_webhook(
             select(Post)
             .where(or_(*clauses))
             .options(selectinload(Post.media), selectinload(Post.publications))
+            .with_for_update()
         )
     if post:
         await apply_provider_payload(post, payload)
+        # A failure callback can belong to an obsolete retry or arrive before
+        # the successful history row. Let the reconciler verify it before
+        # exposing Retry or sending a failure email.
+        for publication in post.publications:
+            if publication.status == "failed":
+                publication.status = "publishing"
+                publication.error_code = "status_verification_pending"
+                publication.error_message = "Verifying the publishing result"
+        post.status = derive_post_status(post)
         await queue_terminal_notification(db, post)
     event.processed_at = datetime.now(UTC)
     await db.commit()

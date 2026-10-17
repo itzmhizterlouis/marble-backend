@@ -4,25 +4,26 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .database import get_db
 from .deps import get_current_user
-from .entitlements import resolve_billing_access
+from .entitlements import TRIAL_DAYS, resolve_billing_access
 from .events import publish_realtime_event
 from .models import (
     ComplimentaryGrant,
     EntitlementAuditEvent,
     FeatureFlag,
     Post,
+    SocialConnection,
     Subscription,
-    TrialUsage,
     User,
     utcnow,
 )
 from .paystack import PaystackClient, PaystackError
+from .providers import ProviderError, UploadPostClient
 
 router = APIRouter(prefix="/v1/admin", tags=["admin"])
 
@@ -32,7 +33,7 @@ class GrantIn(BaseModel):
     reason: str = Field(min_length=5, max_length=1000)
 
 
-class TrialResetIn(BaseModel):
+class ReasonIn(BaseModel):
     reason: str = Field(min_length=5, max_length=1000)
 
 
@@ -65,7 +66,26 @@ async def list_users(
         search = f"%{q.strip()}%"
         query = query.where(or_(User.email.ilike(search), User.name.ilike(search)))
     users = (await db.execute(query)).all()
+    connected: dict[str, list[str]] = {}
+    if users:
+        rows = await db.execute(
+            select(SocialConnection.user_id, SocialConnection.platform)
+            .where(
+                SocialConnection.user_id.in_([user.id for user, _ in users]),
+                SocialConnection.status.in_(["connected", "needs_selection"]),
+            )
+            .order_by(SocialConnection.platform)
+        )
+        for user_id, platform in rows.all():
+            connected.setdefault(user_id, []).append(platform)
+    totals = (
+        await db.execute(
+            select(func.count(User.id), func.count(User.id).filter(User.email_verified.is_(True)))
+        )
+    ).one()
     return {
+        "total_users": totals[0],
+        "verified_users": totals[1],
         "items": [
             {
                 "id": user.id,
@@ -74,6 +94,7 @@ async def list_users(
                 "email_verified": user.email_verified,
                 "created_at": user.created_at,
                 "post_count": post_count,
+                "connected_platforms": connected.get(user.id, []),
                 "billing": (await resolve_billing_access(db, user)).payload(),
             }
             for user, post_count in users
@@ -135,25 +156,86 @@ async def grant_access(
 @router.post("/users/{user_id}/trial-reset")
 async def reset_trial(
     user_id: str,
-    payload: TrialResetIn,
+    payload: ReasonIn,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    if not await db.get(User, user_id):
+    user = await db.get(User, user_id)
+    if not user:
         raise HTTPException(status_code=404, detail={"code": "user_not_found", "message": "Creator not found"})
-    await db.execute(delete(TrialUsage).where(TrialUsage.user_id == user_id))
+    user.trial_ends_at = utcnow() + timedelta(days=TRIAL_DAYS)
     db.add(
         EntitlementAuditEvent(
             user_id=user_id,
             actor_user_id=admin.id,
             action="trial_reset",
             reason=payload.reason,
-            details={},
+            details={"trial_ends_at": user.trial_ends_at.isoformat()},
         )
     )
     await db.commit()
     await publish_realtime_event(user_id, "billing.updated")
-    return {"message": "Trial preview restored"}
+    return {"message": f"Pro trial restarted for {TRIAL_DAYS} days"}
+
+
+@router.post("/users/{user_id}/upload-post-profile/delete")
+async def delete_upload_post_profile(
+    user_id: str,
+    payload: ReasonIn,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail={"code": "user_not_found", "message": "Creator not found"})
+    active = await db.scalar(
+        select(func.count(Post.id)).where(
+            Post.user_id == user_id, Post.status.in_(["scheduled", "queued", "publishing"])
+        )
+    )
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "profile_in_use",
+                "message": f"This creator has {active} scheduled or posting {'post' if active == 1 else 'posts'}. Cancel or let them finish first.",
+            },
+        )
+    already_deleted = False
+    try:
+        await UploadPostClient().delete_profile(user.upload_post_profile)
+    except ProviderError as exc:
+        if exc.status_code != 404:
+            raise HTTPException(
+                status_code=502 if exc.status_code < 500 else exc.status_code,
+                detail={"code": "profile_delete_failed", "message": f"Upload-Post did not delete the profile: {exc}"},
+            ) from exc
+        already_deleted = True
+    connections = list(await db.scalars(select(SocialConnection).where(SocialConnection.user_id == user_id)))
+    for row in connections:
+        row.status = "disconnected"
+        row.reauth_required = False
+        row.provider_account_id = None
+        row.username = row.handle = row.display_name = row.avatar_url = None
+        row.capabilities = []
+        row.connected_at = None
+        row.target_page_id = None
+    db.add(
+        EntitlementAuditEvent(
+            user_id=user_id,
+            actor_user_id=admin.id,
+            action="upload_post_profile_deleted",
+            reason=payload.reason,
+            details={"profile": user.upload_post_profile, "already_deleted": already_deleted},
+        )
+    )
+    await db.commit()
+    await publish_realtime_event(user_id, "connection.updated")
+    return {
+        "message": "Upload-Post profile was already gone; connections cleared"
+        if already_deleted
+        else "Upload-Post profile deleted and connections cleared"
+    }
 
 
 @router.patch("/features/ai")

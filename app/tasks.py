@@ -8,7 +8,7 @@ from pathlib import Path
 
 from celery import Celery
 from celery.exceptions import CeleryError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -18,7 +18,9 @@ from .content import (
     CompiledPlatformContent,
     ContentValidationError,
     compile_and_validate,
-    validate_ai_candidate,
+    validate_compiled_contents,
+    validate_hashtag_count,
+    validate_video_platforms,
 )
 from .database import TaskSessionLocal
 from .events import publish_media_event, publish_post_event, publish_realtime_event
@@ -32,6 +34,7 @@ from .models import (
     PublicationAttempt,
     ReferralCheckout,
     Subscription,
+    SubtitleJob,
     User,
     utcnow,
 )
@@ -43,6 +46,7 @@ from .providers import (
     upload_request_id,
 )
 from .storage import R2Storage, StorageError, materialize_object
+from .subtitles import delete_subtitle_files, selected_video
 
 settings = get_settings()
 UNCLAIMED_QUEUE_TIMEOUT = timedelta(minutes=1)
@@ -51,11 +55,14 @@ MAX_SUBMISSION_ATTEMPTS = 4
 logger = logging.getLogger(__name__)
 celery_app = Celery("marble", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
+    task_routes={"marble.process_subtitles": {"queue": "subtitles"},
+                 "marble.run_analytics_refresh": {"queue": "analytics"}},
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     broker_connection_retry_on_startup=True,
     beat_schedule={
         "reconcile-active-posts": {"task": "marble.reconcile_active", "schedule": 10.0},
+        "reconcile-subtitles": {"task": "marble.reconcile_subtitles", "schedule": 60.0},
         "cleanup-expired-media": {"task": "marble.cleanup_media", "schedule": 3600.0},
         "deliver-post-notifications": {
             "task": "marble.deliver_post_notifications",
@@ -65,6 +72,7 @@ celery_app.conf.update(
         "reconcile-affiliate-payouts": {"task": "marble.reconcile_affiliate_payouts", "schedule": 300.0},
         "sync-due-analytics": {"task": "marble.sync_due_analytics", "schedule": 86400.0},
         "enforce-expired-access": {"task": "marble.enforce_expired_access", "schedule": 3600.0},
+        "send-trial-reminders": {"task": "marble.send_trial_reminders", "schedule": 3600.0},
     },
 )
 
@@ -88,8 +96,9 @@ def filename_derived_title(title: str | None, filename: str) -> bool:
     return bool(generated_title) and title.strip().casefold() == generated_title.casefold()
 
 
-def compile_post_content(post: Post, versions: list) -> list[CompiledPlatformContent]:
+def compile_post_content(post: Post, versions: list, media=None) -> list[CompiledPlatformContent]:
     try:
+        validate_video_platforms(media or post.media, [version.platform for version in versions])
         return compile_and_validate(
             shared_caption=post.caption,
             hashtags=post.hashtags or [],
@@ -277,8 +286,6 @@ async def apply_provider_payload(post: Post, payload: dict) -> None:
     previously_published = {
         item.platform for item in post.publications if item.status == "published"
     }
-    source_request_id = payload.get("request_id")
-    source_job_id = payload.get("job_id")
     by_platform = {item.platform: item for item in post.publications}
     for result in normalized_results(payload):
         platform = result.get("platform")
@@ -286,6 +293,8 @@ async def apply_provider_payload(post: Post, payload: dict) -> None:
         if not publication:
             continue
         next_status = provider_result_status(result)
+        source_request_id = result.get("request_id") or payload.get("request_id")
+        source_job_id = result.get("job_id") or payload.get("job_id")
         source_is_current = (
             (not source_request_id or publication.provider_request_id == source_request_id)
             and (not source_job_id or publication.provider_job_id == source_job_id)
@@ -293,7 +302,7 @@ async def apply_provider_payload(post: Post, payload: dict) -> None:
         # A late callback from an older attempt may confirm success, but it must
         # never demote a newer attempt or a post that is already live.
         if next_status != "published" and (
-            publication.status == "published" or not source_is_current
+            publication.status == "published" or publication.error_code == "retry_pending" or not source_is_current
         ):
             continue
         publication.status = next_status
@@ -304,11 +313,11 @@ async def apply_provider_payload(post: Post, payload: dict) -> None:
                 publication.provider_job_id = source_job_id
         publication.url = result.get("url") or result.get("post_url") or publication.url
         publication.provider_post_id = (
-            str(result.get("post_id") or result.get("video_id") or result.get("publish_id") or "") or None
+            str(result.get("platform_post_id") or result.get("post_id") or result.get("video_id") or result.get("publish_id") or "") or publication.provider_post_id
         )
-        publication.error_code = result.get("error_code") or result.get("skip_reason")
+        publication.error_code = (result.get("error_code") or result.get("skip_reason")) if next_status != "published" else None
         publication.error_message = (
-            (result.get("error") or result.get("message"))
+            (result.get("error") or result.get("error_message") or result.get("message"))
             if publication.status == "failed"
             else None
         )
@@ -403,7 +412,8 @@ async def _publish_post(post_id: str) -> None:
                     "Set a YouTube title before publishing",
                     422,
                 )
-            compiled_versions = compile_post_content(post, post.versions)
+            video = await selected_video(db, post)
+            compiled_versions = compile_post_content(post, post.versions, video)
             compiled_by_platform = {item.platform: item for item in compiled_versions}
             for publication in post.publications:
                 content = compiled_by_platform[publication.platform]
@@ -411,10 +421,10 @@ async def _publish_post(post_id: str) -> None:
                 publication.submitted_title = content.title
                 publication.submitted_hashtags = content.hashtags
             async with materialize_object(
-                storage_backend=post.media.storage_backend,
-                object_key=post.media.object_key,
-                storage_path=post.media.storage_path,
-                filename=post.media.original_name,
+                storage_backend=video.storage_backend,
+                object_key=video.object_key,
+                storage_path=video.storage_path,
+                filename=video.original_name,
             ) as video_path:
                 response = await UploadPostClient().publish_video(
                     profile=post.user.upload_post_profile,
@@ -496,34 +506,76 @@ def publish_post(post_id: str) -> None:
     asyncio.run(_publish_post(post_id))
 
 
+def publication_reference(post: Post, publication: Publication) -> tuple[str | None, str | None]:
+    if publication.provider_request_id or publication.provider_job_id:
+        return publication.provider_request_id, publication.provider_job_id
+    return post.provider_request_id, post.provider_job_id
+
+
+async def recover_publication_history(post: Post, publication: Publication, client: UploadPostClient) -> bool:
+    """Recover a lost retry reference without ever submitting another upload."""
+    for external_id in (post.id, f"{post.id}:{publication.platform}:retry"):
+        history = await client.upload_history(external_id=external_id, platform=publication.platform)
+        for row in history.get("history", []):
+            if (row.get("external_id") == external_id
+                    and row.get("platform") == publication.platform
+                    and row.get("success") is True
+                    and not row.get("fallback_to_inbox")
+                    and (row.get("platform_post_id") or row.get("post_url"))):
+                await apply_provider_payload(post, {"results": [row]})
+                return True
+        # A pending matching upload is also a reason NOT to submit another one.
+        if history.get("in_progress"):
+            publication.status = "publishing"
+            publication.error_code = publication.error_message = None
+            post.status = derive_post_status(post)
+            return True
+    return False
+
+
 async def _reconcile_post(post_id: str) -> None:
     async with TaskSessionLocal() as db:
         post = await db.scalar(
-            select(Post)
-            .where(Post.id == post_id)
+            select(Post).where(Post.id == post_id)
             .options(selectinload(Post.media), selectinload(Post.publications))
+            .with_for_update()
         )
-        if not post or not (post.provider_request_id or post.provider_job_id):
+        if not post:
             return
         before = post_state_signature(post)
-        try:
-            payload = await UploadPostClient().status(
-                request_id=post.provider_request_id, job_id=post.provider_job_id
-            )
-        except ProviderError:
-            return
-        await apply_provider_payload(post, payload)
-        individual = {
-            item.provider_request_id
-            for item in post.publications
-            if item.provider_request_id and item.provider_request_id != post.provider_request_id
-        }
-        for request_id in individual:
-            try:
-                retry_payload = await UploadPostClient().status(request_id=request_id)
-            except ProviderError:
+        client = UploadPostClient()
+        # Poll each destination's CURRENT attempt, not an obsolete parent request.
+        references = {publication_reference(post, p) for p in post.publications
+                      if p.status != "published" and p.error_code != "retry_pending"}
+        uncertain = set()
+        for request_id, job_id in references:
+            targets = {p.platform for p in post.publications
+                       if publication_reference(post, p) == (request_id, job_id)
+                       and p.error_code != "retry_pending"}
+            if not request_id and not job_id:
+                uncertain.update(targets)
                 continue
-            await apply_provider_payload(post, retry_payload)
+            try:
+                payload = await client.status(request_id=request_id, job_id=job_id)
+            except ProviderError:
+                uncertain.update(targets)
+                continue
+            uncertain.update(targets - {r.get("platform") for r in normalized_results(payload)})
+            payload = {**payload, "request_id": payload.get("request_id") or request_id,
+                       "job_id": payload.get("job_id") or job_id}
+            await apply_provider_payload(post, payload)
+        for publication in post.publications:
+            if publication.status == "published" or publication.error_code == "retry_pending":
+                continue
+            # Consult history on terminal failures and uncertain status responses.
+            if publication.status == "failed" or publication.platform in uncertain:
+                try:
+                    await recover_publication_history(post, publication, client)
+                except ProviderError:
+                    publication.status = "publishing"
+                    publication.error_code = "status_verification_pending"
+                    publication.error_message = "Waiting to verify the publishing result"
+        post.status = derive_post_status(post)
         await queue_terminal_notification(db, post)
         await db.commit()
         if post_state_signature(post) != before:
@@ -546,6 +598,7 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                 selectinload(Post.versions),
                 selectinload(Post.publications),
             )
+            .with_for_update()
         )
         if not post:
             return
@@ -553,10 +606,24 @@ async def _retry_platform(post_id: str, platform: str) -> None:
         version = next((item for item in post.versions if item.platform == platform), None)
         if not publication or not version or publication.status != "queued":
             return
+        publication.error_code = publication.error_message = None
         client = UploadPostClient()
-        original_request_id = publication.provider_request_id or post.provider_request_id
-        original_job_id = publication.provider_job_id or post.provider_job_id
+        original_request_id, original_job_id = publication_reference(post, publication)
         provider_confirmed_missing = False
+        try:
+            if await recover_publication_history(post, publication, client):
+                await queue_terminal_notification(db, post)
+                await db.commit()
+                await publish_post_event(post.user_id, post.id)
+                return
+        except ProviderError:
+            publication.status = "publishing"
+            publication.error_code = "status_verification_pending"
+            publication.error_message = "Waiting to verify the original post before retrying"
+            post.status = derive_post_status(post)
+            await db.commit()
+            await publish_post_event(post.user_id, post.id)
+            return
 
         # A local failure can be a false negative. Always ask the provider what
         # happened before creating any new social post.
@@ -569,8 +636,8 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                 if exc.status_code == 404:
                     provider_confirmed_missing = True
                 else:
-                    publication.status = "failed"
-                    publication.error_code = "retry_status_unavailable"
+                    publication.status = "publishing"
+                    publication.error_code = "status_verification_pending"
                     publication.error_message = (
                         "Could not verify the original post, so Reverb did not risk posting it twice"
                     )
@@ -592,7 +659,7 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                 target_status = (
                     provider_result_status(target_result)
                     if target_result
-                    else str(status_payload.get("status", "")).lower()
+                    else "unknown"
                 )
                 if target_status == "completed":
                     target_status = "published"
@@ -617,6 +684,15 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                     await publish_post_event(post.user_id, post.id)
                     return
 
+                if target_status not in {"failed", "action_required"}:
+                    publication.status = "publishing"
+                    publication.error_code = "status_verification_pending"
+                    publication.error_message = "Waiting to verify the original publishing result"
+                    post.status = derive_post_status(post)
+                    await db.commit()
+                    await publish_post_event(post.user_id, post.id)
+                    return
+
                 failed_siblings = [
                     item
                     for item in post.publications
@@ -633,7 +709,32 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                         f"marble-provider-retry:{post.id}:{platform}:{post.schedule_revision}"
                     )
                     try:
-                        await client.retry(
+                        # Provider retries reuse the original submitted copy.
+                        # Reconcile first so a completed attempt is never
+                        # mistaken for a new invalid submission.
+                        if publication.submitted_caption is not None:
+                            try:
+                                validate_snapshot = validate_compiled_contents if platform in {"x", "linkedin"} else None
+                                snapshot = CompiledPlatformContent(
+                                    platform=platform,
+                                    caption=publication.submitted_caption,
+                                    title=publication.submitted_title,
+                                    hashtags=publication.submitted_hashtags or [],
+                                )
+                                if validate_snapshot:
+                                    validate_snapshot([snapshot])
+                                    validate_video_platforms(post.media, [platform])
+                                else:
+                                    validate_hashtag_count(snapshot)
+                            except ContentValidationError as exc:
+                                raise ProviderError(
+                                    "content_validation_failed",
+                                    next(iter(exc.field_errors.values())),
+                                    422,
+                                ) from exc
+                        else:
+                            compile_post_content(post, [version])
+                        retry_response = await client.retry(
                             request_id=original_request_id,
                             job_id=original_job_id,
                             idempotency_key=retry_key,
@@ -643,6 +744,14 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                         publication.error_code = exc.code
                         publication.error_message = str(exc)
                     else:
+                        new_request_id = retry_response.get("request_id")
+                        new_job_id = retry_response.get("job_id")
+                        if not new_request_id and not new_job_id:
+                            new_request_id, new_job_id = original_request_id, original_job_id
+                        elif new_request_id == original_request_id and not new_job_id:
+                            new_job_id = original_job_id
+                        publication.provider_request_id = new_request_id
+                        publication.provider_job_id = new_job_id
                         publication.status = "queued"
                         publication.error_code = publication.error_message = None
                         publication.attempts += 1
@@ -651,8 +760,8 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                             db,
                             publication,
                             kind="provider_retry",
-                            request_id=original_request_id,
-                            job_id=original_job_id,
+                            request_id=publication.provider_request_id,
+                            job_id=publication.provider_job_id,
                             idempotency_key=retry_key,
                             status="submitted",
                         )
@@ -686,15 +795,16 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                     "Set a YouTube title before retrying",
                     422,
                 )
-            compiled_version = compile_post_content(post, [version])[0]
+            video = await selected_video(db, post)
+            compiled_version = compile_post_content(post, [version], video)[0]
             publication.submitted_caption = compiled_version.caption
             publication.submitted_title = compiled_version.title
             publication.submitted_hashtags = compiled_version.hashtags
             async with materialize_object(
-                storage_backend=post.media.storage_backend,
-                object_key=post.media.object_key,
-                storage_path=post.media.storage_path,
-                filename=post.media.original_name,
+                storage_backend=video.storage_backend,
+                object_key=video.object_key,
+                storage_path=video.storage_path,
+                filename=video.original_name,
             ) as video_path:
                 payload = await client.publish_video(
                     profile=post.user.upload_post_profile,
@@ -714,13 +824,14 @@ async def _retry_platform(post_id: str, platform: str) -> None:
                     request_id=expected_request_id,
                 )
             publication.provider_request_id = payload.get("request_id") or expected_request_id
+            publication.provider_job_id = payload.get("job_id")
             mark_connections_used(post, {platform})
             await record_provider_attempt(
                 db,
                 publication,
                 kind="targeted_retry" if not provider_confirmed_missing else "missing_retry",
                 request_id=publication.provider_request_id,
-                job_id=None,
+                job_id=publication.provider_job_id,
                 idempotency_key=retry_key,
                 status="submitted",
             )
@@ -871,8 +982,15 @@ async def _cleanup_media() -> None:
             )
         )
         for asset in assets:
+            active_post = await db.scalar(select(Post.id).where(
+                Post.media_id == asset.id, Post.status.in_(["queued", "publishing", "scheduled"])).limit(1))
+            active_subtitles = await db.scalar(select(SubtitleJob.id).where(
+                SubtitleJob.media_id == asset.id, SubtitleJob.status.in_(["queued", "transcribing", "rendering"])).limit(1))
+            if active_post or active_subtitles:
+                continue
             post_count = await db.scalar(select(func.count(Post.id)).where(Post.media_id == asset.id))
             try:
+                await delete_subtitle_files(db, asset)
                 if asset.storage_backend == "r2":
                     storage = R2Storage()
                     if asset.multipart_upload_id and asset.object_key:
@@ -985,7 +1103,7 @@ def reconcile_affiliate_payouts() -> None:
     asyncio.run(_reconcile_affiliate_payouts())
 
 
-async def _sync_analytics(user_id: str, force: bool = False) -> None:
+async def _sync_analytics(user_id: str, force: bool = False, started_at: float | None = None) -> None:
     from .analytics import sync_user_analytics
     from .entitlements import resolve_billing_access
 
@@ -996,7 +1114,15 @@ async def _sync_analytics(user_id: str, force: bool = False) -> None:
         access = await resolve_billing_access(db, user)
         if not access.capabilities["analytics"]:
             return
-        await sync_user_analytics(db, user, force=force)
+        from .analytics_runtime import AnalyticsDeferred
+        try:
+            await sync_user_analytics(db, user, force=force,
+                                      since=datetime.fromtimestamp(started_at, UTC) if started_at else None)
+        except AnalyticsDeferred:
+            # Preserve progress so a retry resumes instead of rereading every post.
+            await db.commit()
+            await publish_realtime_event(user.id, "analytics.updated")
+            raise
         await publish_realtime_event(user.id, "analytics.updated")
         # AI explanations run as a separate job so a slow model response never
         # delays the real-metrics update reaching the dashboard.
@@ -1006,14 +1132,84 @@ async def _sync_analytics(user_id: str, force: bool = False) -> None:
             logger.warning("Could not queue AI analytics insights for user %s", user.id)
 
 
-@celery_app.task(
-    name="marble.sync_analytics",
-    autoretry_for=(OperationalError,),
-    retry_backoff=True,
-    max_retries=3,
-)
+@celery_app.task(name="marble.sync_analytics", autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def sync_analytics(user_id: str, force: bool = False) -> None:
-    asyncio.run(_sync_analytics(user_id, force))
+    # Legacy/delayed jobs only reserve work; duplicate publication triggers coalesce.
+    from .analytics_runtime import enqueue_analytics
+    enqueue_analytics(user_id, force)
+
+
+@celery_app.task(name="marble.run_analytics_refresh", bind=True, max_retries=None)
+def run_analytics_refresh(self, user_id: str, force: bool, token: str, started_at: float) -> None:
+    import uuid
+
+    from redis.exceptions import RedisError
+
+    from .analytics_runtime import (
+        REFRESH_COOLDOWN,
+        RELEASE,
+        RESERVATION_TTL,
+        AnalyticsDeferred,
+        redis_client,
+        user_key,
+    )
+
+    key, lease = user_key(user_id), uuid.uuid4().hex
+    try:
+        with redis_client() as redis:
+            if redis.get(key) != token:
+                return
+            force = force or redis.get(key + ':force') == '1'
+            # Covers rolling deploys and broker redelivery as well as multiple workers.
+            if not redis.set(key + ':running', lease, nx=True, ex=120):
+                raise AnalyticsDeferred(125)
+
+        async def run():
+            async def heartbeat():
+                while True:
+                    await asyncio.sleep(30)
+                    with redis_client() as redis:
+                        if redis.get(key + ':running') != lease:
+                            raise AnalyticsDeferred(125)
+                        redis.expire(key + ':running', 120)
+                        redis.expire(key, RESERVATION_TTL)
+            work = asyncio.create_task(_sync_analytics(user_id, force, started_at))
+            pulse = asyncio.create_task(heartbeat())
+            try:
+                done, _ = await asyncio.wait({work, pulse}, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    await task
+            finally:
+                work.cancel()
+                pulse.cancel()
+                await asyncio.gather(work, pulse, return_exceptions=True)
+        try:
+            asyncio.run(run())
+        finally:
+            with redis_client() as redis:
+                redis.eval(RELEASE, 1, key + ':running', lease)
+    except (AnalyticsDeferred, RedisError, OperationalError) as exc:
+        delay = exc.seconds if isinstance(exc, AnalyticsDeferred) else 60
+        logger.info("analytics_refresh_deferred user_id=%s retry_seconds=%s", user_id, delay)
+        try:
+            with redis_client() as redis:
+                if redis.get(key) == token:
+                    redis.expire(key, max(RESERVATION_TTL, delay + 3600))
+        except RedisError:
+            pass
+        raise self.retry(exc=exc, countdown=delay) from exc
+    except Exception:
+        with redis_client() as redis:
+            redis.eval(RELEASE, 1, key, token)
+        raise
+    else:
+        try:
+            with redis_client() as redis:
+                if redis.get(key) == token:
+                    redis.set(key + ':completed', '1', ex=REFRESH_COOLDOWN)
+                    redis.eval(RELEASE, 1, key, token)
+        except RedisError as exc:
+            raise self.retry(exc=exc, countdown=60) from exc
 
 
 async def _generate_analytics_insights(user_id: str) -> None:
@@ -1080,6 +1276,14 @@ async def _sync_due_analytics() -> None:
                 select(PublicationMetricSnapshot).where(PublicationMetricSnapshot.captured_at < retention_cutoff)
             )
         )
+        # All-time totals need the latest reading and last valid count even
+        # when both are older than the normal detailed-history retention window.
+        from .analytics import latest_publication_snapshots
+        old_ids = list({row.publication_id for row in old_publication_snapshots})
+        latest = await latest_publication_snapshots(db, old_ids)
+        valid = await latest_publication_snapshots(db, old_ids, successful=True)
+        preserved = {row.id for row in [*latest.values(), *valid.values()]}
+        old_publication_snapshots = [row for row in old_publication_snapshots if row.id not in preserved]
         old_period_snapshots = list(
             await db.scalars(
                 select(AnalyticsPeriodSnapshot).where(
@@ -1104,6 +1308,7 @@ def sync_due_analytics() -> None:
 
 
 async def _run_ai_generation(job_id: str) -> None:
+    from .ai_copy import finalize_ai_candidate, validate_finalized_candidate
     from .gemini import GeminiClient, GeminiError
 
     async with TaskSessionLocal() as db:
@@ -1167,18 +1372,24 @@ async def _run_ai_generation(job_id: str) -> None:
         gemini_file = None
         try:
             client = GeminiClient(on_stage=enter_stage)
+            adjustments = job.adjustments or job.adjustment
+            if isinstance(adjustments, list) and len(adjustments) == 1:
+                adjustments = adjustments[0]
             if job.kind == "adjustment":
                 if not parent or not parent.candidate:
                     raise GeminiError("The previous AI suggestion is no longer available")
                 if parent.media_id != post.media_id:
                     raise GeminiError("The video changed. Generate a new suggestion for the current video")
-                candidate, usage = await client.adjust_candidate(
-                    parent.candidate,
-                    job.adjustment or "regenerate",
-                    job.generation_context or "",
-                    video_observations=parent.video_observations,
-                    platforms=[version.platform for version in post.versions],
-                )
+                if adjustments == "retry_x":
+                    candidate, usage = dict(parent.candidate), {}
+                else:
+                    candidate, usage = await client.adjust_candidate(
+                        parent.candidate,
+                        adjustments or "regenerate",
+                        job.generation_context or "",
+                        video_observations=parent.video_observations,
+                        platforms=[version.platform for version in post.versions],
+                    )
             else:
                 enter_stage("media_lookup")
                 media = await db.get(MediaAsset, job.media_id)
@@ -1201,6 +1412,7 @@ async def _run_ai_generation(job_id: str) -> None:
                     gemini_file = await client.upload_file(video_path, media.mime_type)
                     candidate, observations, usage = await client.create_candidate(
                         file=gemini_file,
+                        adjustments=job.adjustments or [],
                         current_caption=post.caption,
                         hashtags=post.hashtags or [],
                         platforms=[version.platform for version in post.versions],
@@ -1209,14 +1421,21 @@ async def _run_ai_generation(job_id: str) -> None:
                     job.video_observations = observations
                     if observations is None:
                         logger.warning("ai_job_observations_missing job_id=%s", job.id)
+            enter_stage("candidate_repair")
+            candidate, usage = await finalize_ai_candidate(
+                client, candidate, [version.platform for version in post.versions], adjustments, usage, retry_x=adjustments == "retry_x",
+            )
             enter_stage("candidate_validation")
             try:
-                candidate = validate_ai_candidate(
+                candidate = validate_finalized_candidate(
                     candidate, [version.platform for version in post.versions]
                 )
             except ContentValidationError as exc:
                 reason = next(iter(exc.field_errors.values()), "invalid platform content")
                 raise GeminiError(f"AI suggestion needs regeneration: {reason}") from exc
+            if candidate.get("platform_errors", {}).get("x"):
+                logger.warning("ai_job_partial job_id=%s platform=x error_code=%s", job.id,
+                               candidate["platform_errors"]["x"]["code"])
             job.candidate = candidate
             job.status = "completed"
             job.input_tokens = usage.get("promptTokenCount")
@@ -1329,3 +1548,85 @@ async def _enforce_expired_access() -> None:
 @celery_app.task(name="marble.enforce_expired_access")
 def enforce_expired_access() -> None:
     asyncio.run(_enforce_expired_access())
+
+
+TRIAL_REMINDER_LEAD = timedelta(hours=24)
+
+
+async def _send_trial_reminders() -> None:
+    from .email import send_trial_ending_email
+    from .entitlements import resolve_billing_access
+
+    if not get_settings().trial_reminder_emails_enabled:
+        return
+    now = utcnow()
+    async with TaskSessionLocal() as db:
+        user_ids = list(
+            await db.scalars(
+                select(User.id).where(
+                    User.email_verified.is_(True),
+                    User.trial_ends_at > now,
+                    User.trial_ends_at <= now + TRIAL_REMINDER_LEAD,
+                    or_(
+                        User.trial_reminder_sent_for.is_(None),
+                        User.trial_reminder_sent_for != User.trial_ends_at,
+                    ),
+                )
+            )
+        )
+    for user_id in user_ids:
+        async with TaskSessionLocal() as db:
+            user = await db.get(User, user_id)
+            if not user or not user.trial_ends_at:
+                continue
+            access = await resolve_billing_access(db, user)
+            if access.tier != "trial":
+                continue
+            previous = user.trial_reminder_sent_for
+            # Claim the reminder before sending so concurrent workers send at most one email.
+            claimed = await db.execute(
+                update(User)
+                .where(
+                    User.id == user.id,
+                    User.trial_ends_at == user.trial_ends_at,
+                    or_(
+                        User.trial_reminder_sent_for.is_(None),
+                        User.trial_reminder_sent_for != User.trial_ends_at,
+                    ),
+                )
+                .values(trial_reminder_sent_for=user.trial_ends_at)
+            )
+            await db.commit()
+            if claimed.rowcount != 1:
+                continue
+            claimed_for = ends_at = user.trial_ends_at
+            if ends_at.tzinfo is None:
+                ends_at = ends_at.replace(tzinfo=UTC)
+            try:
+                await send_trial_ending_email(user.email, user.name, f"{ends_at:%-d %B %Y at %H:%M} UTC")
+            except Exception:
+                logger.warning("Could not deliver trial reminder to %s", user_id, exc_info=True)
+                # Release the claim so the next hourly run retries while the trial is still active.
+                await db.execute(
+                    update(User)
+                    .where(User.id == user_id, User.trial_reminder_sent_for == claimed_for)
+                    .values(trial_reminder_sent_for=previous)
+                )
+                await db.commit()
+
+
+@celery_app.task(name="marble.send_trial_reminders")
+def send_trial_reminders() -> None:
+    asyncio.run(_send_trial_reminders())
+
+
+@celery_app.task(name="marble.process_subtitles", soft_time_limit=1900, time_limit=2000)
+def process_subtitles(job_id: str, run_token: str):
+    from .subtitle_worker import process
+    asyncio.run(process(job_id, run_token))
+
+
+@celery_app.task(name="marble.reconcile_subtitles")
+def reconcile_subtitles():
+    from .subtitle_worker import reconcile
+    asyncio.run(reconcile())

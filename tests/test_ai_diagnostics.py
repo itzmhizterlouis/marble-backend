@@ -36,6 +36,8 @@ def test_gemini_generation_timeout_has_a_visible_error_and_stage(monkeypatch):
     stages = []
 
     def handler(request):
+        assert "key=" not in str(request.url)
+        assert request.headers["x-goog-api-key"] == "test-key"
         raise httpx.ReadTimeout("", request=request)
 
     original_client = httpx.AsyncClient
@@ -132,6 +134,8 @@ def test_first_pass_returns_copy_and_grounded_observations_in_one_request(monkey
             "facebook_caption": "",
             "youtube_title": "",
             "youtube_description": "",
+            "x_caption": "",
+            "linkedin_caption": "",
             "video_observations": {
                 "summary": "A creator shows a handmade bag.",
                 "details": ["The bag is blue."],
@@ -145,8 +149,13 @@ def test_first_pass_returns_copy_and_grounded_observations_in_one_request(monkey
         current_caption="",
         hashtags=[],
         platforms=["instagram"],
+        adjustments=["more_engaging", "shorter"],
     ))
 
+    prompt = captured["parts"][1]["text"]
+    assert "AT MOST 10 words" in prompt
+    assert "opening more engaging" in prompt
+    assert "ALL selected adjustments" in prompt
     assert captured["schema"] is VIDEO_GENERATION_SCHEMA
     assert captured["parts"][0]["fileData"]["fileUri"] == "files/test"
     assert candidate["instagram_caption"] == "A handmade bag in the studio."
@@ -155,7 +164,8 @@ def test_first_pass_returns_copy_and_grounded_observations_in_one_request(monkey
     assert usage["promptTokenCount"] == 120
 
 
-def test_text_only_variant_uses_observations_without_video_part(monkeypatch):
+@pytest.mark.parametrize("adjustment", ["regenerate", "shorter", ["more_engaging", "shorter", "professional", "casual"]])
+def test_text_only_variant_uses_observations_without_video_part(monkeypatch, adjustment):
     monkeypatch.setattr(get_settings(), "gemini_api_key", "test-key")
     client = GeminiClient()
     captured = {}
@@ -167,7 +177,7 @@ def test_text_only_variant_uses_observations_without_video_part(monkeypatch):
     monkeypatch.setattr(client, "_generate", fake_generate)
     asyncio.run(client.adjust_candidate(
         {"shared_caption": "An old opening"},
-        "regenerate",
+        adjustment,
         "Emphasize the blue stitching",
         video_observations={"summary": "A creator shows a bag.", "details": ["Blue stitching is visible."], "uncertainties": []},
         platforms=["instagram"],
@@ -177,6 +187,13 @@ def test_text_only_variant_uses_observations_without_video_part(monkeypatch):
     assert "fileData" not in captured["parts"][0]
     assert "Blue stitching is visible" in captured["parts"][0]["text"]
     assert "Emphasize the blue stitching" in captured["parts"][0]["text"]
+    if "shorter" in adjustment:
+        assert "AT MOST 10 words" in captured["parts"][0]["text"]
+    if isinstance(adjustment, list):
+        assert "ALL selected adjustments together in ONE suggestion" in captured["parts"][0]["text"]
+        assert "engaging and inviting" in captured["parts"][0]["text"]
+        assert "professional tone" in captured["parts"][0]["text"]
+        assert "conversational tone" in captured["parts"][0]["text"]
 
 
 def test_invalid_observation_notes_do_not_discard_valid_copy(monkeypatch):
@@ -193,6 +210,8 @@ def test_invalid_observation_notes_do_not_discard_valid_copy(monkeypatch):
             "facebook_caption": "",
             "youtube_title": "",
             "youtube_description": "",
+            "x_caption": "",
+            "linkedin_caption": "",
             "video_observations": {"summary": "", "details": [], "uncertainties": []},
         }, {}
 
@@ -206,3 +225,34 @@ def test_invalid_observation_notes_do_not_discard_valid_copy(monkeypatch):
 
     assert candidate["instagram_caption"] == "A creator shows a bag."
     assert observations is None
+
+
+def test_shortening_has_a_ten_second_deadline_and_distinct_stage(monkeypatch):
+    monkeypatch.setattr(get_settings(), "gemini_api_key", "test-key")
+    client = GeminiClient()
+    captured = {}
+
+    async def fake_generate(parts, schema, **kwargs):
+        captured.update(kwargs)
+        assert all("fileData" not in part for part in parts)
+        return {"x_caption": "A blue bag."}, {}
+
+    monkeypatch.setattr(client, "_generate_json", fake_generate)
+    asyncio.run(client.repair_copy({"x_caption": "long copy"}, {"x_caption": {"max_units": 250}}))
+    assert captured["timeout"] == 10
+    assert captured["stage"] == "gemini_repair"
+
+
+def test_generation_deadline_stops_a_stalled_transport(monkeypatch):
+    monkeypatch.setattr(get_settings(), "gemini_api_key", "test-key")
+
+    async def stalled(request):
+        await asyncio.Event().wait()
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr("app.gemini.httpx.AsyncClient",
+                        lambda **kwargs: original_client(transport=httpx.MockTransport(stalled), **kwargs))
+    with pytest.raises(GeminiError) as error:
+        asyncio.run(GeminiClient()._generate_json([{"text": "test"}], {}, temperature=0.3,
+                                                invalid_message="invalid", timeout=0.01))
+    assert error.value.code == "gemini_generation_timeout"

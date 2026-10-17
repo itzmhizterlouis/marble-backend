@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
 from sqlalchemy import or_, select
@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .models import ComplimentaryGrant, Subscription, TrialUsage, User, utcnow
+
+TRIAL_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -33,9 +35,15 @@ def _aware(value: datetime | None) -> datetime | None:
     return value
 
 
-def _capabilities(plan: str | None, *, trial: bool = False) -> dict[str, bool]:
+def start_trial(user: User) -> None:
+    """Start the one-time Pro trial when a creator's email is first verified."""
+    if user.email_verified and user.trial_ends_at is None:
+        user.trial_ends_at = utcnow() + timedelta(days=TRIAL_DAYS)
+
+
+def _capabilities(plan: str | None) -> dict[str, bool]:
     return {
-        "publish": bool(plan in {"basic", "pro"} or trial),
+        "publish": plan in {"basic", "pro"},
         "schedule": bool(plan in {"basic", "pro"}),
         "analytics": plan == "pro",
         "ai_creation": plan == "pro",
@@ -104,7 +112,10 @@ async def resolve_billing_access(db: AsyncSession, user: User) -> BillingAccess:
                 enforcement_enabled=True,
             )
 
-    if grant:
+    trial_ends_at = _aware(user.trial_ends_at)
+    trial_active = bool(user.email_verified and trial_ends_at and trial_ends_at > now)
+    # The Pro trial outranks a lower complimentary grant until it ends.
+    if grant and (grant.plan == "pro" or not trial_active):
         return BillingAccess(
             tier="complimentary",
             plan=grant.plan,
@@ -115,12 +126,14 @@ async def resolve_billing_access(db: AsyncSession, user: User) -> BillingAccess:
             enforcement_enabled=True,
         )
 
-    if user.email_verified and not trial:
+    if trial_active:
         return BillingAccess(
             tier="trial",
-            plan=None,
-            capabilities=_capabilities(None, trial=True),
-            trial_consumed=False,
+            plan="pro",
+            capabilities=_capabilities("pro"),
+            access_until=trial_ends_at,
+            trial_consumed=bool(trial),
+            trial_post_id=trial.post_id if trial else None,
             enforcement_enabled=True,
         )
     return BillingAccess(
@@ -148,30 +161,3 @@ async def require_capability(db: AsyncSession, user: User, capability: str) -> B
     if not access.capabilities.get(capability, False):
         raise upgrade_required(capability)
     return access
-
-
-async def reserve_trial_publication(
-    db: AsyncSession,
-    user: User,
-    *,
-    post_id: str,
-    provider_account_ids: list[str],
-) -> TrialUsage:
-    # Locking the user row serializes first-publication attempts across different posts.
-    await db.scalar(select(User).where(User.id == user.id).with_for_update())
-    usage = await db.scalar(select(TrialUsage).where(TrialUsage.user_id == user.id))
-    if usage:
-        if usage.post_id == post_id:
-            return usage
-        raise upgrade_required("publish", message="Your one-post preview has been used. Choose a plan to continue")
-    usage = TrialUsage(
-        user_id=user.id,
-        post_id=post_id,
-        provider_account_ids=sorted(set(provider_account_ids)),
-        status="consumed",
-        reserved_at=utcnow(),
-        consumed_at=utcnow(),
-    )
-    db.add(usage)
-    await db.flush()
-    return usage

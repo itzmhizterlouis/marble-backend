@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     brevo_sender_email: str = ""
     brevo_sender_name: str = "Reverb"
     publish_failure_emails_enabled: bool = True
+    trial_reminder_emails_enabled: bool = True
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/v1/auth/google/callback"
@@ -46,6 +47,9 @@ class Settings(BaseSettings):
     admin_emails: str = ""
     billing_enforcement_enabled: bool = False
     affiliate_enabled: bool = False
+    groq_api_key: str = ""
+    subtitles_enabled: bool = True
+    subtitles_daily_limit: int = 20
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     ai_enabled: bool = True

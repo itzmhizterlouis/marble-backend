@@ -12,6 +12,11 @@ async def send_transactional_email(
     to_email: str, to_name: str, subject: str, html: str
 ) -> str | None:
     settings = get_settings()
+    logo_url = escape(f"{settings.frontend_url.rstrip('/')}/assets/reverb-logo-v2.jpg", quote=True)
+    html = (
+        f'<p><img src="{logo_url}" alt="Reverb" width="56" height="56" '
+        'style="display:block;border:0;border-radius:12px" /></p>' + html
+    )
     if not settings.brevo_api_key or not settings.brevo_sender_email:
         if settings.is_production:
             raise RuntimeError("Brevo is not configured")
@@ -60,6 +65,16 @@ async def send_payment_attention_email(email: str, name: str, grace_until: str) 
         name,
         "Your Reverb payment needs attention",
         f'<p>Hi {escape(name)},</p><p>Your subscription renewal did not complete. Your paid features remain available until {escape(grace_until)}.</p><p>Paystack does not automatically retry this payment, so please update your payment method or subscribe again.</p><p><a href="{url}">Review billing</a></p>',
+    )
+
+
+async def send_trial_ending_email(email: str, name: str, ends_at: str) -> None:
+    url = f"{get_settings().frontend_url}/pricing"
+    await send_transactional_email(
+        email,
+        name,
+        "Your Reverb Pro trial ends tomorrow",
+        f'<p>Hi {escape(name)},</p><p>Your free Reverb Pro trial ends on {escape(ends_at)}.</p><p>Choose Basic or Pro to keep publishing. Nothing is charged automatically, and your posts and history stay in your account. Any posts scheduled after your trial ends will return to drafts unless you choose a plan.</p><p><a href="{url}">Choose a plan</a></p>',
     )
 
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+
+from twitter_text import parse_tweet
 
 INSTAGRAM_PROHIBITED_HASHTAGS = {
     "a$$",
@@ -97,6 +100,9 @@ INSTAGRAM_PROHIBITED_HASHTAGS = {
 
 MAX_HASHTAGS = 100
 MAX_HASHTAG_LENGTH = 100
+# Input-list safety bounds above are not platform publishing limits.
+# Verified 2026-10-05: https://support.google.com/youtube/answer/6390658
+PLATFORM_HASHTAG_LIMITS = {"youtube": 60}
 _HASHTAG_TOKEN = re.compile(r"(?<![\w#])#([^\s#]+)", re.UNICODE)
 _TRAILING_PUNCTUATION = ".,!?;:()[]{}\"'"
 
@@ -164,6 +170,74 @@ def utf8_bytes(value: str) -> int:
     return len(value.encode("utf-8"))
 
 
+def x_caption_units(text: str) -> int:
+    """Use twitter-text weighting for emoji, URLs and normalized Unicode."""
+    return parse_tweet(text).weightedLength
+
+
+def validate_video_platforms(media: Any, platforms: Iterable[str]) -> None:
+    """Check metadata available after Reverb's existing video processing."""
+    errors = {}
+    for platform in platforms:
+        if platform not in {"x", "linkedin"}:
+            continue
+        label = "X" if platform == "x" else "LinkedIn"
+        duration = media.duration_seconds
+        width, height = media.width, media.height
+        message = None
+        if platform == "linkedin":
+            if not 75_000 <= media.size_bytes <= 500_000_000:
+                message = "LinkedIn videos must be between 75 KB and 500 MB."
+            elif duration is not None and not 3 <= duration <= 1800:
+                message = "LinkedIn videos must be between 3 seconds and 30 minutes."
+            elif width and height and (not 256 <= width <= 4096 or not 144 <= height <= 2304 or not 1 / 2.4 <= width / height <= 2.4):
+                message = "LinkedIn requires 256×144 to 4096×2304 pixels and an aspect ratio between 1:2.4 and 2.4:1."
+        else:
+            if media.size_bytes > 8_000_000_000 or (duration is not None and duration > 1200):
+                message = "X videos must be at most 20 minutes and 8 GB in Reverb."
+            # Upload-Post automatically adapts video geometry for each destination.
+            # Let its /upload pipeline handle X dimensions/aspect ratio for now,
+            # schedules and retries; keep hard duration and file-size limits.
+            # https://docs.upload-post.com/api/video-requirements/#automatic-video-transformation
+        if message:
+            errors[f"versions.{platform}.media"] = f"{label}: {message}"
+    if errors:
+        raise ContentValidationError(errors)
+
+
+def count_hashtags(text: str) -> int:
+    """Count occurrences, not unique tags, without rewriting creator text.
+
+    Match the frontend's Unicode letters/numbers/marks boundary rules. Ignore
+    bare hashes, markdown headings, word-internal hashes and URL fragments.
+    """
+    count = 0
+    for match in re.finditer("#", text):
+        index = match.start()
+        if index:
+            previous = text[index - 1]
+            if previous in "_/#" or unicodedata.category(previous)[0] in "LNM":
+                continue
+        if index + 1 < len(text):
+            following = text[index + 1]
+            if following == "_" or unicodedata.category(following)[0] in "LN":
+                count += 1
+    return count
+
+
+def validate_hashtag_count(content: CompiledPlatformContent) -> None:
+    limit = PLATFORM_HASHTAG_LIMITS.get(content.platform)
+    if limit is None:
+        return
+    count = count_hashtags(content.caption) + count_hashtags(content.title or "")
+    if count > limit:
+        raise ContentValidationError({
+            f"versions.{content.platform}.caption":
+                f"You have {count} hashtags across your title and description. "
+                f"Remove {count - limit}; YouTube ignores all hashtags above {limit}."
+        })
+
+
 def _hashtags_in_caption(caption: str) -> set[str]:
     return {
         item.strip(_TRAILING_PUNCTUATION).casefold()
@@ -191,6 +265,12 @@ def compile_platform_contents(
         title_value = _value(version, "title")
         title = str(title_value).strip() if title_value else None
         options = _value(version, "options", {}) or {}
+        platform_hashtags = normalized_hashtags
+        # AI may propose fewer tags for X. An explicit edit to the shared tags
+        # makes this proposal obsolete; manual content is never shortened here.
+        if (platform == "x" and options.get("ai_hashtags_source") == normalized_hashtags
+                and isinstance(options.get("ai_hashtags"), list)):
+            platform_hashtags = normalize_hashtags(options["ai_hashtags"])
         if content_format_version >= 2:
             use_shared = _value(version, "use_shared_caption")
             separate = (
@@ -199,7 +279,7 @@ def compile_platform_contents(
                 else options.get("separate_caption") is True
             )
             body = caption if separate else shared_caption
-            caption = compose_caption(body, normalized_hashtags)
+            caption = compose_caption(body, platform_hashtags)
         else:
             caption = caption.strip()
         compiled.append(
@@ -207,7 +287,7 @@ def compile_platform_contents(
                 platform=platform,
                 caption=caption,
                 title=title,
-                hashtags=normalized_hashtags,
+                hashtags=platform_hashtags,
             )
         )
     return compiled
@@ -256,12 +336,25 @@ def validate_compiled_contents(contents: Iterable[CompiledPlatformContent]) -> N
                 field_errors[title_field] = "Add a YouTube title"
             elif len(content.title) > 100:
                 field_errors[title_field] = f"Reduce by {len(content.title) - 100} characters"
+        elif platform == "x":
+            count = x_caption_units(content.caption)
+            if count > 280:
+                field_errors[caption_field] = "Shorten the X caption to 280 weighted characters, including hashtags. Reverb publishes one video post, not a thread."
+        elif platform == "linkedin":
+            count = utf16_units(content.caption)
+            if count > 3000:
+                field_errors[caption_field] = f"Reduce by {count - 3000} UTF-16 units"
         elif platform == "facebook":
             count = len(content.caption)
             if count > 63206:
                 field_errors[caption_field] = f"Reduce by {count - 63206} characters"
             if content.title and len(content.title) > 255:
                 field_errors[title_field] = f"Reduce by {len(content.title) - 255} characters"
+        try:
+            validate_hashtag_count(content)
+        except ContentValidationError as exc:
+            for field, message in exc.field_errors.items():
+                field_errors.setdefault(field, message)
     if field_errors:
         raise ContentValidationError(field_errors)
 
@@ -317,6 +410,11 @@ def validate_ai_candidate(candidate: dict, platforms: Iterable[str]) -> dict:
                     "options": {"separate_caption": True},
                 }
             )
+    if "x_hashtags" in candidate:
+        x_tags = normalize_hashtags(candidate["x_hashtags"])
+        for version in versions:
+            if version["platform"] == "x":
+                version["options"].update(ai_hashtags=x_tags, ai_hashtags_source=normalized)
     compile_and_validate(
         shared_caption=candidate.get("shared_caption") or "",
         hashtags=normalized,
