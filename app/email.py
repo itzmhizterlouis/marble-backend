@@ -78,6 +78,16 @@ async def send_trial_ending_email(email: str, name: str, ends_at: str) -> None:
     )
 
 
+async def send_trial_extended_email(email: str, name: str, extra_days: int, ends_at: str) -> None:
+    url = f"{get_settings().frontend_url}/create"
+    await send_transactional_email(
+        email,
+        name,
+        f"We've added {extra_days} more days to your Reverb Pro trial",
+        f'<p>Hi {escape(name)},</p><p>Good news: we have extended your free Reverb Pro trial by {extra_days} days. It now runs until {escape(ends_at)}.</p><p>Use the extra time to upload once and publish to all your platforms. Nothing is charged automatically, and your posts and history stay in your account.</p><p><a href="{url}">Open Reverb</a></p>',
+    )
+
+
 async def send_access_expired_email(email: str, name: str, cancelled_schedules: int) -> None:
     url = f"{get_settings().frontend_url}/billing"
     schedule_note = (

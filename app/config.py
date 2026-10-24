@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     brevo_sender_name: str = "Reverb"
     publish_failure_emails_enabled: bool = True
     trial_reminder_emails_enabled: bool = True
+    trial_extension_emails_enabled: bool = True
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/v1/auth/google/callback"

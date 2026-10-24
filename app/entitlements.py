@@ -11,6 +11,7 @@ from .config import get_settings
 from .models import ComplimentaryGrant, Subscription, TrialUsage, User, utcnow
 
 TRIAL_DAYS = 7
+TRIAL_EXTENSION_DAYS = 7
 
 
 @dataclass(frozen=True)

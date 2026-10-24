@@ -49,6 +49,8 @@ class User(Base, TimestampMixin):
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # The trial end this creator was last reminded about; a restarted trial earns a new reminder.
     trial_reminder_sent_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trial_extended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trial_extension_emailed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     sessions: Mapped[list[AuthSession]] = relationship(back_populates="user", cascade="all, delete-orphan")
     connections: Mapped[list[SocialConnection]] = relationship(

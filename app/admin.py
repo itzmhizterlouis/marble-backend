@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .database import get_db
 from .deps import get_current_user
-from .entitlements import TRIAL_DAYS, resolve_billing_access
+from .entitlements import TRIAL_DAYS, TRIAL_EXTENSION_DAYS, resolve_billing_access
 from .events import publish_realtime_event
 from .models import (
     ComplimentaryGrant,
@@ -38,6 +38,11 @@ class GrantIn(BaseModel):
 
 class ReasonIn(BaseModel):
     reason: str = Field(min_length=5, max_length=1000)
+
+
+class TrialExtensionIn(BaseModel):
+    reason: str = Field(min_length=5, max_length=1000)
+    dry_run: bool = True
 
 
 class AIFeatureIn(BaseModel):
@@ -204,6 +209,59 @@ async def reset_trial(
     await db.commit()
     await publish_realtime_event(user_id, "billing.updated")
     return {"message": f"Pro trial restarted for {TRIAL_DAYS} days"}
+
+
+@router.post("/trial-extension")
+async def extend_all_trials(
+    payload: TrialExtensionIn,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Give every verified trial creator who never paid (and was not extended yet) more Pro days."""
+    now = utcnow()
+    users = list(
+        await db.scalars(
+            select(User).where(
+                User.email_verified.is_(True),
+                User.trial_ends_at.is_not(None),
+                User.trial_extended_at.is_(None),
+                ~select(Subscription.id).where(Subscription.user_id == User.id).exists(),
+            )
+        )
+    )
+    extension = timedelta(days=TRIAL_EXTENSION_DAYS)
+    active = expired = 0
+    changes: list[tuple[User, datetime, datetime]] = []
+    for user in users:
+        ends = user.trial_ends_at if user.trial_ends_at.tzinfo else user.trial_ends_at.replace(tzinfo=UTC)
+        if ends > now:
+            active += 1
+            new_end = ends + extension
+        else:
+            expired += 1
+            new_end = now + extension
+        changes.append((user, ends, new_end))
+    summary = {"extra_days": TRIAL_EXTENSION_DAYS, "active": active, "expired": expired, "total": len(changes)}
+    if payload.dry_run:
+        return {**summary, "applied": False}
+    for user, old_end, new_end in changes:
+        user.trial_ends_at = new_end
+        user.trial_extended_at = now
+        db.add(
+            EntitlementAuditEvent(
+                user_id=user.id,
+                actor_user_id=admin.id,
+                action="trial_extended_bulk",
+                reason=payload.reason,
+                details={"previous_trial_ends_at": old_end.isoformat(), "trial_ends_at": new_end.isoformat(), "extra_days": TRIAL_EXTENSION_DAYS},
+            )
+        )
+    await db.commit()
+    if changes:
+        from .tasks import send_trial_extension_emails
+
+        send_trial_extension_emails.delay()
+    return {**summary, "applied": True}
 
 
 @router.post("/users/{user_id}/upload-post-profile/delete")

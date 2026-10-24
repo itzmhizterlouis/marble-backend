@@ -73,6 +73,7 @@ celery_app.conf.update(
         "sync-due-analytics": {"task": "marble.sync_due_analytics", "schedule": 86400.0},
         "enforce-expired-access": {"task": "marble.enforce_expired_access", "schedule": 3600.0},
         "send-trial-reminders": {"task": "marble.send_trial_reminders", "schedule": 3600.0},
+        "send-trial-extension-emails": {"task": "marble.send_trial_extension_emails", "schedule": 300.0},
     },
 )
 
@@ -1630,3 +1631,51 @@ def process_subtitles(job_id: str, run_token: str):
 def reconcile_subtitles():
     from .subtitle_worker import reconcile
     asyncio.run(reconcile())
+
+
+TRIAL_EXTENSION_EMAIL_BATCH = 200
+
+
+async def _send_trial_extension_emails() -> None:
+    from .email import send_trial_extended_email
+    from .entitlements import TRIAL_EXTENSION_DAYS
+
+    if not get_settings().trial_extension_emails_enabled:
+        return
+    async with TaskSessionLocal() as db:
+        user_ids = list(
+            await db.scalars(
+                select(User.id)
+                .where(User.trial_extended_at.is_not(None), User.trial_extension_emailed_at.is_(None))
+                .order_by(User.trial_extended_at)
+                .limit(TRIAL_EXTENSION_EMAIL_BATCH)
+            )
+        )
+    for user_id in user_ids:
+        async with TaskSessionLocal() as db:
+            # Claim before sending so concurrent workers never email the same creator twice.
+            claimed = await db.execute(
+                update(User)
+                .where(User.id == user_id, User.trial_extension_emailed_at.is_(None))
+                .values(trial_extension_emailed_at=utcnow())
+            )
+            await db.commit()
+            if claimed.rowcount != 1:
+                continue
+            user = await db.get(User, user_id)
+            if not user or not user.trial_ends_at:
+                continue
+            ends_at = user.trial_ends_at if user.trial_ends_at.tzinfo else user.trial_ends_at.replace(tzinfo=UTC)
+            try:
+                await send_trial_extended_email(
+                    user.email, user.name, TRIAL_EXTENSION_DAYS, f"{ends_at:%-d %B %Y at %H:%M} UTC"
+                )
+            except Exception:
+                logger.warning("Could not deliver trial extension email to %s", user_id, exc_info=True)
+                await db.execute(update(User).where(User.id == user_id).values(trial_extension_emailed_at=None))
+                await db.commit()
+
+
+@celery_app.task(name="marble.send_trial_extension_emails")
+def send_trial_extension_emails() -> None:
+    asyncio.run(_send_trial_extension_emails())
