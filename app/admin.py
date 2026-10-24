@@ -17,6 +17,7 @@ from .models import (
     EntitlementAuditEvent,
     FeatureFlag,
     Post,
+    Publication,
     SocialConnection,
     Subscription,
     User,
@@ -209,6 +210,55 @@ async def reset_trial(
     await db.commit()
     await publish_realtime_event(user_id, "billing.updated")
     return {"message": f"Pro trial restarted for {TRIAL_DAYS} days"}
+
+
+@router.get("/views-summary")
+async def platform_views_summary(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Latest lifetime views across every creator, using the same rules as each creator's Home total."""
+    del admin
+    from .analytics import (
+        ANALYTICS_PLATFORMS,
+        latest_publication_snapshots,
+        summary_metric,
+        usable_view_result,
+    )
+
+    publications = list(
+        await db.scalars(
+            select(Publication).where(
+                Publication.status == "published", Publication.platform.in_(ANALYTICS_PLATFORMS)
+            )
+        )
+    )
+    ids = [publication.id for publication in publications]
+    latest: dict = {}
+    successful: dict = {}
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        latest.update(await latest_publication_snapshots(db, chunk))
+        successful.update(await latest_publication_snapshots(db, chunk, successful=True))
+    per_platform: dict[str, dict] = {}
+    for publication in publications:
+        result = usable_view_result(publication, latest.get(publication.id), successful.get(publication.id))
+        if result is None:
+            continue
+        entry = per_platform.setdefault(
+            publication.platform, {"platform": publication.platform, "views": 0, "posts": 0}
+        )
+        entry["views"] += result["metrics"][summary_metric(publication.platform)]
+        entry["posts"] += 1
+    platforms = sorted(per_platform.values(), key=lambda item: item["platform"])
+    creators = await db.scalar(select(func.count(func.distinct(Post.user_id)))) or 0
+    return {
+        "total_views": sum(item["views"] for item in platforms),
+        "counted_posts": sum(item["posts"] for item in platforms),
+        "published_destinations": len(publications),
+        "creators_with_posts": creators,
+        "platforms": platforms,
+    }
 
 
 @router.post("/trial-extension")
