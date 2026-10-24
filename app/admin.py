@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -18,6 +19,7 @@ from .models import (
     FeatureFlag,
     Post,
     Publication,
+    PublicationMetricSnapshot,
     SocialConnection,
     Subscription,
     User,
@@ -258,6 +260,100 @@ async def platform_views_summary(
         "published_destinations": len(publications),
         "creators_with_posts": creators,
         "platforms": platforms,
+    }
+
+
+@router.get("/analytics-diagnostics")
+async def analytics_diagnostics(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Explain, per platform, why view totals may look small: missing readings, failures, metric names."""
+    del admin
+    from .analytics import (
+        ANALYTICS_PLATFORMS,
+        flatten_metrics,
+        latest_publication_snapshots,
+        usable_view_result,
+    )
+
+    publications = list(
+        await db.scalars(
+            select(Publication).where(
+                Publication.status == "published", Publication.platform.in_(ANALYTICS_PLATFORMS)
+            )
+        )
+    )
+    ids = [publication.id for publication in publications]
+    latest: dict = {}
+    successful: dict = {}
+    newest_available: dict = {}
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        latest.update(await latest_publication_snapshots(db, chunk))
+        successful.update(await latest_publication_snapshots(db, chunk, successful=True))
+        ranked = (
+            select(
+                PublicationMetricSnapshot.id,
+                func.row_number()
+                .over(
+                    partition_by=PublicationMetricSnapshot.publication_id,
+                    order_by=(PublicationMetricSnapshot.captured_at.desc(), PublicationMetricSnapshot.id.desc()),
+                )
+                .label("position"),
+            )
+            .where(
+                PublicationMetricSnapshot.publication_id.in_(chunk),
+                PublicationMetricSnapshot.provider_status == "available",
+            )
+            .subquery()
+        )
+        for snapshot in await db.scalars(
+            select(PublicationMetricSnapshot)
+            .join(ranked, ranked.c.id == PublicationMetricSnapshot.id)
+            .where(ranked.c.position == 1)
+        ):
+            newest_available[snapshot.publication_id] = snapshot
+    stats: dict[str, dict] = {
+        platform: {
+            "platform": platform, "published_posts": 0, "with_reading": 0, "no_reading_yet": 0,
+            "reading_without_views": 0, "hidden": 0, "failed_refreshes": 0,
+            "errors": Counter(), "metric_names": Counter(),
+        }
+        for platform in ANALYTICS_PLATFORMS
+    }
+    for publication in publications:
+        row = stats[publication.platform]
+        row["published_posts"] += 1
+        newest = latest.get(publication.id)
+        if publication.analytics_hidden_at is not None:
+            row["hidden"] += 1
+        if newest is None:
+            row["no_reading_yet"] += 1
+            continue
+        if newest.provider_status != "available":
+            row["failed_refreshes"] += 1
+            row["errors"][(newest.error_message or "No message")[:140]] += 1
+        seen = newest_available.get(publication.id)
+        if seen is not None:
+            raw = seen.raw_metrics if isinstance(seen.raw_metrics, dict) else {}
+            container = raw.get("post_metrics") if isinstance(raw.get("post_metrics"), dict) else raw
+            for name in {key for key in flatten_metrics(container) if "." not in key}:
+                row["metric_names"][name] += 1
+        if usable_view_result(publication, newest, successful.get(publication.id)) is not None:
+            row["with_reading"] += 1
+        elif seen is not None:
+            row["reading_without_views"] += 1
+    return {
+        "platforms": [
+            {
+                **{key: value for key, value in row.items() if key not in {"errors", "metric_names"}},
+                "errors": [{"message": message, "count": count} for message, count in row["errors"].most_common(4)],
+                "metric_names": [{"name": name, "posts": count} for name, count in row["metric_names"].most_common(14)],
+            }
+            for row in stats.values()
+            if row["published_posts"]
+        ]
     }
 
 
