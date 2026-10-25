@@ -17,6 +17,7 @@ from .models import (
     ComplimentaryGrant,
     EntitlementAuditEvent,
     FeatureFlag,
+    MediaAsset,
     Post,
     Publication,
     PublicationMetricSnapshot,
@@ -254,7 +255,16 @@ async def platform_views_summary(
         entry["posts"] += 1
     platforms = sorted(per_platform.values(), key=lambda item: item["platform"])
     creators = await db.scalar(select(func.count(func.distinct(Post.user_id)))) or 0
+    videos_uploaded = await db.scalar(select(func.count(MediaAsset.id)).where(MediaAsset.status == "ready")) or 0
+    posts_created = await db.scalar(select(func.count(Post.id))) or 0
+    posts_published = (
+        await db.scalar(select(func.count(func.distinct(Publication.post_id))).where(Publication.status == "published"))
+        or 0
+    )
     return {
+        "videos_uploaded": videos_uploaded,
+        "posts_created": posts_created,
+        "posts_published": posts_published,
         "total_views": sum(item["views"] for item in platforms),
         "counted_posts": sum(item["posts"] for item in platforms),
         "published_destinations": len(publications),

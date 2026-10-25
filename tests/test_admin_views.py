@@ -59,6 +59,9 @@ def test_admin_views_summary_totals_visible_published_posts_only(client, monkeyp
     after = client.get("/v1/admin/views-summary", headers=admin_headers).json()
 
     assert after["total_views"] - before["total_views"] == 157
+    assert after["videos_uploaded"] - before["videos_uploaded"] == 6
+    assert after["posts_created"] - before["posts_created"] == 6
+    assert after["posts_published"] - before["posts_published"] == 5   # the failed LinkedIn post never published
     assert after["counted_posts"] - before["counted_posts"] == 3
     assert after["creators_with_posts"] - before["creators_with_posts"] == 1
     by_platform = {item["platform"]: item["views"] for item in after["platforms"]}
