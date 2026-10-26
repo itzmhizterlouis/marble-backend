@@ -235,6 +235,8 @@ async def create_post(
             status_code=404,
             detail={"code": "media_not_found", "message": "Upload not found"},
         )
+    if media.purpose == "clipping":
+        raise HTTPException(409, detail={"code": "clipping_source_not_publishable", "message": "Choose a generated clip to publish, rather than the long source video"})
     if media.status == "failed":
         raise HTTPException(
             status_code=409,
@@ -287,6 +289,8 @@ async def update_post(
                 status_code=404,
                 detail={"code": "media_not_found", "message": "Upload not found"},
             )
+        if media.purpose == "clipping":
+            raise HTTPException(409, detail={"code": "clipping_source_not_publishable", "message": "Choose a generated clip to publish"})
         if media.status == "failed":
             raise HTTPException(
                 status_code=409,

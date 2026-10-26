@@ -105,11 +105,11 @@ class R2Storage:
 
         return await asyncio.to_thread(generate)
 
-    async def presign_download(self, key: str) -> str:
+    async def presign_download(self, key: str, *, ttl_seconds: int = 3600) -> str:
         def generate() -> str:
             try:
                 return self.client.generate_presigned_url(
-                    "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=3600,
+                    "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=ttl_seconds,
                 )
             except (BotoCoreError, ClientError, OSError, ValueError) as exc:
                 raise StorageError() from exc

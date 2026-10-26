@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     subtitles_enabled: bool = True
     subtitles_daily_limit: int = 20
+    clipping_enabled: bool = False
+    clipping_max_upload_bytes: int = 2 * 1024 * 1024 * 1024
+    clipping_max_duration_seconds: int = 3600
+    clipping_monthly_credits: int = 600
+    vizard_api_key: str = ""
+    vizard_clip_model: Literal["clip_v1", "clip_v2"] = "clip_v1"
+    vizard_clean_template_id: int | None = None
+    vizard_bold_template_id: int | None = None
+    vizard_webhook_token: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     ai_enabled: bool = True
@@ -58,6 +67,11 @@ class Settings(BaseSettings):
     ai_adjustment_daily_limit: int = 100
     ai_global_video_daily_limit: int = 1000
     ai_global_adjustment_daily_limit: int = 5000
+
+    @field_validator("vizard_clean_template_id", "vizard_bold_template_id", mode="before")
+    @classmethod
+    def optional_vizard_template(cls, value):
+        return None if value == "" else value
 
     @field_validator("frontend_url", "api_public_url", "paystack_callback_url", mode="before")
     @classmethod

@@ -16,6 +16,7 @@ from .ai import router as ai_router
 from .analytics import router as analytics_router
 from .auth import router as auth_router
 from .billing import router as billing_router
+from .clipping import router as clipping_router
 from .config import get_settings
 from .connections import router as connections_router
 from .database import Base, SessionLocal, engine
@@ -118,6 +119,7 @@ async def unexpected_exception_handler(request: Request, exc: Exception):
 
 
 app.include_router(auth_router)
+app.include_router(clipping_router)
 app.include_router(billing_router)
 app.include_router(affiliate_router)
 app.include_router(analytics_router)

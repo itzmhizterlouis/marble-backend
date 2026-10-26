@@ -14,6 +14,7 @@ from .deps import get_current_user
 from .entitlements import TRIAL_DAYS, TRIAL_EXTENSION_DAYS, resolve_billing_access
 from .events import publish_realtime_event
 from .models import (
+    ClippingAccess,
     ComplimentaryGrant,
     EntitlementAuditEvent,
     FeatureFlag,
@@ -116,6 +117,7 @@ async def list_users(
             select(func.count(User.id), func.count(User.id).filter(User.email_verified.is_(True)))
         )
     ).one()
+    clipping_users = set(await db.scalars(select(ClippingAccess.user_id).where(ClippingAccess.enabled.is_(True))))
     return {
         "total_users": totals[0],
         "verified_users": totals[1],
@@ -133,6 +135,7 @@ async def list_users(
                 "post_count": post_count,
                 "connected_platforms": connected.get(user.id, []),
                 "billing": (await resolve_billing_access(db, user)).payload(),
+                "clipping_enabled": user.id in clipping_users,
             }
             for user, post_count in users
         ]

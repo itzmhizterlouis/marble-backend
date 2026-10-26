@@ -99,6 +99,7 @@ class FacebookPageSelection(BaseModel):
 
 
 class MediaInitIn(BaseModel):
+    purpose: Literal["post", "clipping"] = "post"
     filename: str = Field(min_length=1, max_length=255)
     mime_type: Literal["video/mp4", "video/quicktime"]
     size_bytes: int = Field(gt=0)
@@ -117,6 +118,8 @@ class MediaPartUrlOut(BaseModel):
 
 
 class MediaOut(BaseModel):
+    purpose: Literal["post", "clipping"] = "post"
+    baked_subtitles: bool = False
     id: str
     original_name: str
     mime_type: str

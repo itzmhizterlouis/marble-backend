@@ -92,6 +92,8 @@ async def start_subtitles(
     # Serializes job creation and retries for this user's media and rate budget.
     await db.scalar(select(User).where(User.id == user.id).with_for_update())
     asset = await owned_media(db, user, media_id, lock=True)
+    if asset.purpose == "clipping" or asset.baked_subtitles:
+        raise HTTPException(409, detail={"code": "subtitles_unavailable", "message": "Choose a generated clip without existing subtitles to add Auto subtitles"})
     if asset.status != "ready":
         raise HTTPException(
             409, detail={"code": "media_not_ready", "message": "Finish uploading your video first"}

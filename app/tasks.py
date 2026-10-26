@@ -28,6 +28,8 @@ from .media import create_thumbnail, probe_video, sha256_file
 from .models import (
     AIGenerationJob,
     BillingEvent,
+    ClippingProject,
+    GeneratedClip,
     MediaAsset,
     Post,
     Publication,
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 celery_app = Celery("marble", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
     task_routes={"marble.process_subtitles": {"queue": "subtitles"},
+                 "marble.run_clipping_project": {"queue": "clipping"},
                  "marble.run_analytics_refresh": {"queue": "analytics"}},
     task_acks_late=True,
     task_reject_on_worker_lost=True,
@@ -64,6 +67,7 @@ celery_app.conf.update(
         "reconcile-active-posts": {"task": "marble.reconcile_active", "schedule": 10.0},
         "reconcile-subtitles": {"task": "marble.reconcile_subtitles", "schedule": 60.0},
         "cleanup-expired-media": {"task": "marble.cleanup_media", "schedule": 3600.0},
+        "reconcile-clipping": {"task": "marble.reconcile_clipping", "schedule": 30.0},
         "deliver-post-notifications": {
             "task": "marble.deliver_post_notifications",
             "schedule": 30.0,
@@ -117,6 +121,7 @@ async def _process_media(media_id: str) -> None:
         if not asset or asset.status not in {"processing", "uploaded"}:
             return
         asset.status = "processing"
+        maximum_duration = settings.clipping_max_duration_seconds if asset.purpose == "clipping" else 600
         await db.commit()
 
         try:
@@ -133,8 +138,8 @@ async def _process_media(media_id: str) -> None:
                     thumbnail = video_path.parent / f"{asset.id}.jpg"
                     checksum = await asyncio.to_thread(sha256_file, video_path)
                     duration, width, height = await asyncio.to_thread(probe_video, video_path)
-                    if duration < 1 or duration > 600:
-                        raise ValueError("Videos must be between 1 second and 10 minutes")
+                    if duration < 1 or duration > maximum_duration:
+                        raise ValueError("Video duration exceeds the allowed limit")
                     await asyncio.to_thread(create_thumbnail, video_path, thumbnail)
                     thumbnail_key = asset.thumbnail_key or storage.thumbnail_key(asset.user_id, asset.id)
                     await storage.put_file(thumbnail, thumbnail_key, "image/jpeg")
@@ -142,8 +147,8 @@ async def _process_media(media_id: str) -> None:
                 video_path = Path(asset.storage_path)
                 checksum = await asyncio.to_thread(sha256_file, video_path)
                 duration, width, height = await asyncio.to_thread(probe_video, video_path)
-                if duration < 1 or duration > 600:
-                    raise ValueError("Videos must be between 1 second and 10 minutes")
+                if duration < 1 or duration > maximum_duration:
+                    raise ValueError("Video duration exceeds the allowed limit")
                 thumbnail = settings.storage_root / "thumbnails" / f"{asset.id}.jpg"
                 await asyncio.to_thread(create_thumbnail, video_path, thumbnail)
                 thumbnail_key = None
@@ -983,6 +988,17 @@ async def _cleanup_media() -> None:
             )
         )
         for asset in assets:
+            active_clipping = await db.scalar(select(ClippingProject.id).where(
+                ClippingProject.source_media_id == asset.id, ClippingProject.status.in_(["queued", "submitting", "uncertain", "processing", "importing"])).limit(1))
+            generated = await db.scalar(select(GeneratedClip).where(GeneratedClip.media_id == asset.id))
+            if generated:
+                clipping = await db.get(ClippingProject, generated.project_id)
+                if clipping and clipping.status in {"queued", "submitting", "processing", "importing"}:
+                    continue
+                if generated.post_id:
+                    continue
+            if active_clipping:
+                continue
             active_post = await db.scalar(select(Post.id).where(
                 Post.media_id == asset.id, Post.status.in_(["queued", "publishing", "scheduled"])).limit(1))
             active_subtitles = await db.scalar(select(SubtitleJob.id).where(
@@ -1004,7 +1020,8 @@ async def _cleanup_media() -> None:
             except StorageError:
                 logger.exception("Could not clean up media asset %s", asset.id)
                 continue
-            if post_count:
+            clipping_reference = generated or await db.scalar(select(ClippingProject.id).where(ClippingProject.source_media_id == asset.id).limit(1))
+            if post_count or clipping_reference:
                 if asset.storage_backend == "r2":
                     asset.object_key = ""
                     asset.multipart_upload_id = None
@@ -1012,6 +1029,9 @@ async def _cleanup_media() -> None:
                     asset.storage_path = ""
                 asset.status = "expired"
                 asset.delete_after = None
+                if clipping_reference and not post_count:
+                    asset.thumbnail_key = None
+                    asset.thumbnail_path = None
             else:
                 if asset.storage_backend != "r2" and asset.thumbnail_path:
                     Path(asset.thumbnail_path).unlink(missing_ok=True)
@@ -1022,6 +1042,18 @@ async def _cleanup_media() -> None:
 @celery_app.task(name="marble.cleanup_media")
 def cleanup_media() -> None:
     asyncio.run(_cleanup_media())
+
+
+@celery_app.task(name="marble.run_clipping_project")
+def run_clipping_project(project_id: str) -> None:
+    from .clipping_worker import run_project
+    asyncio.run(run_project(project_id))
+
+
+@celery_app.task(name="marble.reconcile_clipping")
+def reconcile_clipping() -> None:
+    from .clipping_worker import reconcile_due
+    asyncio.run(reconcile_due())
 
 
 async def _process_billing_event(event_id: str) -> None:

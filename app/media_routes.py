@@ -62,6 +62,8 @@ def media_out(
         token = create_media_token(asset.id)
         thumbnail_url = f"{settings.api_public_url}/v1/media/{asset.id}/thumbnail?token={token}"
     return MediaOut(
+        purpose=asset.purpose,
+        baked_subtitles=asset.baked_subtitles,
         id=asset.id,
         original_name=asset.original_name,
         mime_type=asset.mime_type,
@@ -97,6 +99,9 @@ async def owned_media(db: AsyncSession, user: User, media_id: str, *, lock: bool
         raise HTTPException(
             status_code=404, detail={"code": "media_not_found", "message": "Upload not found"}
         )
+    if asset.purpose == "clipping":
+        from .clipping import require_clipping
+        await require_clipping(db, user)
     return asset
 
 
@@ -104,15 +109,22 @@ async def owned_media(db: AsyncSession, user: User, media_id: str, *, lock: bool
 async def initialize_media(
     payload: MediaInitIn, user: User = Depends(require_verified_user), db: AsyncSession = Depends(get_db)
 ):
-    await require_capability(db, user, "publish")
     settings = get_settings()
-    if payload.size_bytes > settings.max_upload_bytes:
+    if payload.purpose == "clipping":
+        from .clipping import require_clipping
+        await require_clipping(db, user)
+        maximum = settings.clipping_max_upload_bytes
+    else:
+        await require_capability(db, user, "publish")
+        maximum = settings.max_upload_bytes
+    if payload.size_bytes > maximum:
         raise HTTPException(
-            status_code=413, detail={"code": "file_too_large", "message": "Videos can be up to 500 MB"}
+            status_code=413, detail={"code": "file_too_large", "message": "Long videos can be up to 2 GB" if payload.purpose == "clipping" else "Videos can be up to 500 MB"}
         )
     suffix = ".mov" if payload.mime_type == "video/quicktime" else ".mp4"
     asset = MediaAsset(
         user_id=user.id,
+        purpose=payload.purpose,
         original_name=Path(payload.filename).name,
         mime_type=payload.mime_type,
         size_bytes=payload.size_bytes,
@@ -565,7 +577,10 @@ async def complete_media(
     try:
         from .tasks import process_media
 
-        process_media.delay(asset.id)
+        if asset.purpose == "clipping":
+            process_media.apply_async(args=[asset.id], queue="clipping")
+        else:
+            process_media.delay(asset.id)
     except CeleryError as exc:
         asset = await owned_media(db, user, media_id, lock=True)
         asset.status = "uploaded"
@@ -579,6 +594,35 @@ async def complete_media(
         ) from exc
     await publish_media_event(user.id, asset.id)
     return media_out(asset)
+
+
+@router.get("/{media_id}/access")
+async def media_access(media_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    asset = await owned_media(db, user, media_id)
+    if asset.status != "ready":
+        raise HTTPException(409, detail={"code": "media_not_ready", "message": "This video is not available yet"})
+    if asset.storage_backend == "r2":
+        if not asset.object_key:
+            raise HTTPException(404, detail="Video not found")
+        try:
+            return {"url": await R2Storage().presign_download(asset.object_key)}
+        except StorageError as exc:
+            raise HTTPException(503, detail="Video storage is temporarily unavailable") from exc
+    token = create_media_token(f"file:{asset.id}")
+    return {"url": f"{get_settings().api_public_url}/v1/media/{asset.id}/file?token={token}"}
+
+
+@router.get("/{media_id}/file", include_in_schema=False)
+async def media_file(media_id: str, token: str = Query(...), db: AsyncSession = Depends(get_db)):
+    try:
+        if decode_media_token(token) != f"file:{media_id}":
+            raise jwt.InvalidTokenError()
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(401, detail="Invalid media token") from exc
+    asset = await db.get(MediaAsset, media_id)
+    if not asset or asset.storage_backend != "local" or asset.status != "ready" or not Path(asset.storage_path).is_file():
+        raise HTTPException(404, detail="Video not found")
+    return FileResponse(asset.storage_path, media_type=asset.mime_type, headers={"Cache-Control": "private, no-store"})
 
 
 @router.get("/{media_id}/thumbnail", include_in_schema=False)
@@ -620,6 +664,11 @@ async def delete_media(
 ):
     await require_capability(db, user, "publish")
     asset = await owned_media(db, user, media_id)
+    from .models import ClippingProject, GeneratedClip
+    reference = await db.scalar(select(ClippingProject.id).where(ClippingProject.source_media_id == asset.id).limit(1))
+    clip_reference = await db.scalar(select(GeneratedClip.id).where(GeneratedClip.media_id == asset.id).limit(1))
+    if reference or clip_reference:
+        raise HTTPException(409, detail={"code": "media_in_use", "message": "Manage this video from Clips"})
     count = await db.scalar(select(func.count(Post.id)).where(Post.media_id == asset.id))
     if count:
         raise HTTPException(
