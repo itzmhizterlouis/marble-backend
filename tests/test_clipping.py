@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -302,3 +303,81 @@ def test_admin_grants_require_owner_and_are_audited(client, monkeypatch):
     assert response.status_code == 200, response.text
     assert response.json() == {"enabled": True, "monthly_minutes": 120}
     assert client.get("/v1/admin/users", headers=headers).json()["items"][0]["clipping_enabled"] is True
+
+
+def unused_clip(client, monkeypatch):
+    from app.models import GeneratedClip
+    user_id, headers, _ = enable_creator(client, monkeypatch)
+    media_id = source(user_id, purpose="clipping")
+    project = client.post("/v1/clips/projects", headers=headers, json={"media_id": media_id}).json()
+    async def insert():
+        async with SessionLocal() as db:
+            output = MediaAsset(user_id=user_id, original_name="clip.mp4", mime_type="video/mp4", size_bytes=10, uploaded_bytes=10,
+                                storage_path="", storage_backend="r2", object_key="output.mp4", status="ready", duration_seconds=45, width=1080, height=1920)
+            db.add(output)
+            await db.flush()
+            clip = GeneratedClip(project_id=project["id"], user_id=user_id, provider_clip_id="1", media_id=output.id, title="A useful story", status="ready")
+            db.add(clip)
+            await db.commit()
+            return output.id, clip.id
+    output_id, clip_id = asyncio.run(insert())
+    return user_id, headers, output_id, clip_id
+
+
+def test_unused_generated_media_requires_grant_even_through_media_access(client, monkeypatch):
+    from app.models import ClippingAccess
+    user_id, headers, output_id, _ = unused_clip(client, monkeypatch)
+    async def revoke():
+        async with SessionLocal() as db:
+            grant = await db.get(ClippingAccess, user_id)
+            grant.enabled = False
+            await db.commit()
+    asyncio.run(revoke())
+    assert client.get(f"/v1/media/{output_id}/access", headers=headers).status_code == 403
+
+
+def test_normal_post_endpoint_cannot_duplicate_a_generated_clip(client, monkeypatch):
+    _, headers, output_id, clip_id = unused_clip(client, monkeypatch)
+    result = client.post("/v1/posts", headers=headers, json={"media_id": output_id, "caption": "Duplicate"})
+    assert result.status_code == 409
+    assert result.json()["code"] == "clip_draft_required"
+    assert client.post(f"/v1/clips/items/{clip_id}/draft", headers=headers).status_code == 200
+
+
+@pytest.mark.parametrize("probe_error", [subprocess.CalledProcessError(1, ["ffprobe"]), subprocess.TimeoutExpired(["ffprobe"], 30), IndexError("No video stream")])
+def test_invalid_output_does_not_block_other_clips(client, monkeypatch, probe_error):
+    from app.clipping_worker import run_project
+    from app.models import ClippingProject
+    user_id, headers, _ = enable_creator(client, monkeypatch)
+    media_id = source(user_id, purpose="clipping")
+    project = client.post("/v1/clips/projects", headers=headers, json={"media_id": media_id}).json()
+    async def accepted():
+        async with SessionLocal() as db:
+            row = await db.get(ClippingProject, project["id"])
+            row.provider_project_id, row.status, row.billing_status = "789", "processing", "submitted"
+            await db.commit()
+    asyncio.run(accepted())
+    probes = []
+    def probe(path):
+        probes.append(path)
+        if len(probes) == 1:
+            raise probe_error
+        return 45, 1080, 1920
+    def thumbnail(path, output):
+        output.write_bytes(b"jpeg")
+    async def put(self, path, key, content_type):
+        pass
+    monkeypatch.setattr("app.clipping_worker.probe_video", probe)
+    monkeypatch.setattr("app.clipping_worker.create_thumbnail", thumbnail)
+    monkeypatch.setattr("app.clipping_worker.R2Storage.put_file", put)
+    with respx.mock as mock:
+        mock.get("https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/789").mock(return_value=httpx.Response(200, json={"code": 2000, "videos": [
+            {"videoId": 1, "title": "Broken", "videoUrl": "https://cdn-video.vizard.ai/one.mp4"},
+            {"videoId": 2, "title": "Good", "videoUrl": "https://cdn-video.vizard.ai/two.mp4"}]}))
+        mock.get("https://cdn-video.vizard.ai/one.mp4").mock(return_value=httpx.Response(200, content=b"one"))
+        mock.get("https://cdn-video.vizard.ai/two.mp4").mock(return_value=httpx.Response(200, content=b"two"))
+        asyncio.run(run_project(project["id"]))
+    result = client.get(f"/v1/clips/projects/{project['id']}", headers=headers).json()
+    assert result["status"] == "ready"
+    assert sorted(clip["status"] for clip in result["clips"]) == ["failed", "ready"]
+    assert result["can_retry"] is True
