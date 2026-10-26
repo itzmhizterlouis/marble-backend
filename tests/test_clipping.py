@@ -137,6 +137,20 @@ def test_long_sources_cannot_be_used_as_normal_posts(client, monkeypatch):
     assert denied.json()["code"] == "clipping_source_not_publishable"
 
 
+def test_clipping_upload_limit_does_not_raise_normal_post_limit(client, monkeypatch):
+    _, headers, _ = enable_creator(client, monkeypatch)
+    async def multipart(self, key, content_type):
+        return "test-upload"
+    monkeypatch.setattr("app.media_routes.R2Storage.create_multipart_upload", multipart)
+    payload = {"filename": "long.mp4", "mime_type": "video/mp4", "size_bytes": 600 * 1024 * 1024}
+    assert client.post("/v1/media", headers=headers, json=payload).status_code == 413
+    accepted = client.post("/v1/media", headers=headers, json={**payload, "purpose": "clipping"})
+    assert accepted.status_code == 201, accepted.text
+    assert accepted.json()["purpose"] == "clipping"
+    oversized = client.post("/v1/media", headers=headers, json={**payload, "purpose": "clipping", "size_bytes": 2147483649})
+    assert oversized.status_code == 413
+
+
 def test_one_clip_creates_one_draft_and_cannot_leak_to_another_creator(client, monkeypatch):
     user_id, headers, _ = enable_creator(client, monkeypatch)
     media_id = source(user_id, purpose="clipping")

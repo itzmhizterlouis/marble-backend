@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from celery.exceptions import CeleryError
+from kombu.exceptions import OperationalError as BrokerError
 from sqlalchemy import func, select
 
 from .config import get_settings
@@ -214,5 +215,5 @@ async def reconcile_due() -> None:
     for project_id in ids:
         try:
             dispatch_project(project_id)
-        except CeleryError:
+        except (CeleryError, BrokerError, OSError):
             continue

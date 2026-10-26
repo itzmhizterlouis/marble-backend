@@ -6,6 +6,7 @@ from typing import Literal
 
 from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from kombu.exceptions import OperationalError as BrokerError
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -167,7 +168,7 @@ async def create_project(payload: ProjectIn, user: User = Depends(require_verifi
     await db.commit()
     try:
         dispatch_project(project.id)
-    except CeleryError:
+    except (CeleryError, BrokerError, OSError):
         # The periodic reconciler dispatches the durable queued record; no lost work.
         pass
     await publish_realtime_event(user.id, "clips.updated")
@@ -186,7 +187,7 @@ async def retry_import(project_id: str, user: User = Depends(require_verified_us
     await db.commit()
     try:
         dispatch_project(project.id)
-    except CeleryError:
+    except (CeleryError, BrokerError, OSError):
         pass
     return {"message": "Existing clips will be checked without submitting your video again"}
 
@@ -305,7 +306,10 @@ async def reconcile(project_id: str, payload: ReconcileIn, admin: User = Depends
     project.provider_project_id, project.status, project.next_check_at, project.error_message = payload.provider_project_id, "processing", utcnow(), None
     db.add(EntitlementAuditEvent(user_id=project.user_id, actor_user_id=admin.id, action="clipping_submission_reconciled", reason=payload.reason, details={"project_id": project.id}))
     await db.commit()
-    dispatch_project(project.id)
+    try:
+        dispatch_project(project.id)
+    except (CeleryError, BrokerError, OSError):
+        pass
     return {"message": "Existing submission matched and scheduled for reconciliation"}
 
 
@@ -314,9 +318,13 @@ async def callback(request: Request, token: str = Query(default=""), db: AsyncSe
     secret = get_settings().vizard_webhook_token
     if not secret or not hmac.compare_digest(token, secret):
         raise fail("invalid_callback", "Invalid callback", 401)
-    body = await request.body()
-    if len(body) > 65536:
-        raise fail("callback_too_large", "Invalid callback", 413)
+    parts, size = [], 0
+    async for part in request.stream():
+        size += len(part)
+        if size > 65536:
+            raise fail("callback_too_large", "Invalid callback", 413)
+        parts.append(part)
+    body = b"".join(parts)
     import json
     try:
         payload = json.loads(body)
