@@ -45,3 +45,4 @@ jobs:
           alembic downgrade 0015_ai_video_observations
           alembic upgrade head
           python tests/check_referral_migration.py check-concurrency
+          python tests/check_clipping_migration.py

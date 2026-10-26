@@ -241,3 +241,50 @@ def test_global_budget_is_reserved_across_creators(client, monkeypatch):
     response = client.post("/v1/clips/projects", headers=second_headers, json={"media_id": two})
     assert response.status_code == 409
     assert response.json()["code"] == "clipping_capacity_reached"
+
+
+def test_worker_imports_once_and_retry_only_queries_existing_project(client, monkeypatch):
+    from app.clipping_worker import run_project
+    user_id, headers, _ = enable_creator(client, monkeypatch)
+    media_id = source(user_id, purpose="clipping")
+    project = client.post("/v1/clips/projects", headers=headers, json={"media_id": media_id}).json()
+
+    async def signed(self, key, **kwargs):
+        return "https://storage.example.com/source.mp4"
+    async def put_file(self, path, key, content_type):
+        assert path.is_file()
+    def thumbnail(path, output):
+        output.write_bytes(b"jpeg")
+    monkeypatch.setattr("app.clipping_worker.R2Storage.presign_download", signed)
+    monkeypatch.setattr("app.clipping_worker.R2Storage.put_file", put_file)
+    monkeypatch.setattr("app.clipping_worker.probe_video", lambda path: (45, 1080, 1920))
+    monkeypatch.setattr("app.clipping_worker.create_thumbnail", thumbnail)
+    with respx.mock as mock:
+        submit = mock.post("https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create").mock(return_value=httpx.Response(200, json={"code": 2000, "projectId": 12345}))
+        query = mock.get("https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/12345").mock(return_value=httpx.Response(200, json={"code": 2000, "projectId": 12345, "videos": [{"videoId": 55, "title": "A complete story", "videoUrl": "https://cdn-video.vizard.ai/export.mp4"}]}))
+        download = mock.get("https://cdn-video.vizard.ai/export.mp4").mock(return_value=httpx.Response(200, content=b"video"))
+        asyncio.run(run_project(project["id"]))
+        asyncio.run(run_project(project["id"]))
+        ready = client.get(f"/v1/clips/projects/{project['id']}", headers=headers).json()
+        assert ready["status"] == "ready"
+        assert ready["clips"][0]["media"]["baked_subtitles"] is True
+        assert ready["clips"][0]["media"]["purpose"] == "post"
+        assert "videoUrl" not in str(ready) and "storage.example.com" not in str(ready)
+        assert client.post(f"/v1/clips/projects/{project['id']}/retry", headers=headers).status_code == 202
+        asyncio.run(run_project(project["id"]))
+        assert len(submit.calls) == len(download.calls) == 1
+        assert len(query.calls) == 2
+
+
+def test_admin_grants_require_owner_and_are_audited(client, monkeypatch):
+    _, headers = creator(client)
+    target_id, _ = creator(client)
+    body = {"enabled": True, "monthly_minutes": 120, "reason": "Private beta invitation"}
+    path = f"/v1/admin/clipping/users/{target_id}"
+    assert client.put(path, json=body, headers=headers).status_code == 403
+    email = client.get("/v1/auth/me", headers=headers).json()["email"]
+    monkeypatch.setattr(get_settings(), "admin_emails", email)
+    response = client.put(path, json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"enabled": True, "monthly_minutes": 120}
+    assert client.get("/v1/admin/users", headers=headers).json()["items"][0]["clipping_enabled"] is True

@@ -18,7 +18,17 @@ from .deps import get_current_user, require_verified_user
 from .entitlements import require_capability
 from .events import publish_realtime_event
 from .media_routes import media_out
-from .models import ClippingAccess, ClippingProject, EntitlementAuditEvent, FeatureFlag, GeneratedClip, MediaAsset, Post, User, utcnow
+from .models import (
+    ClippingAccess,
+    ClippingProject,
+    EntitlementAuditEvent,
+    FeatureFlag,
+    GeneratedClip,
+    MediaAsset,
+    Post,
+    User,
+    utcnow,
+)
 from .posts import owned_post, post_out
 from .vizard import VizardClient, VizardError
 
