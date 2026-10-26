@@ -25,7 +25,7 @@ from .entitlements import (
 )
 from .events import publish_post_event
 from .media_routes import media_out
-from .models import MediaAsset, PlatformVersion, Post, Publication, SocialConnection, User
+from .models import GeneratedClip, MediaAsset, PlatformVersion, Post, Publication, SocialConnection, User
 from .notifications import queue_terminal_notification
 from .providers import ProviderError, UploadPostClient
 from .schemas import (
@@ -237,6 +237,8 @@ async def create_post(
         )
     if media.purpose == "clipping":
         raise HTTPException(409, detail={"code": "clipping_source_not_publishable", "message": "Choose a generated clip to publish, rather than the long source video"})
+    if await db.scalar(select(GeneratedClip.id).where(GeneratedClip.media_id == media.id).limit(1)):
+        raise HTTPException(409, detail={"code": "clip_draft_required", "message": "Use Post clip in Clips to open this video's existing draft"})
     if media.status == "failed":
         raise HTTPException(
             status_code=409,
@@ -278,6 +280,8 @@ async def update_post(
             detail={"code": "post_locked", "message": "Use schedule editing for a scheduled post"},
         )
     if post.media_id != payload.media_id:
+        if await db.scalar(select(GeneratedClip.id).where(GeneratedClip.post_id == post.id).limit(1)):
+            raise HTTPException(409, detail={"code": "clip_media_locked", "message": "Keep this generated clip with its post. Create a new post to use another video."})
         media = await db.scalar(
             select(MediaAsset).where(
                 MediaAsset.id == payload.media_id,
@@ -291,6 +295,8 @@ async def update_post(
             )
         if media.purpose == "clipping":
             raise HTTPException(409, detail={"code": "clipping_source_not_publishable", "message": "Choose a generated clip to publish"})
+        if await db.scalar(select(GeneratedClip.id).where(GeneratedClip.media_id == media.id).limit(1)):
+            raise HTTPException(409, detail={"code": "clip_draft_required", "message": "Use Post clip in Clips to open this video's existing draft"})
         if media.status == "failed":
             raise HTTPException(
                 status_code=409,

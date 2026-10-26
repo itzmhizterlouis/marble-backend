@@ -1,5 +1,6 @@
 """Dedicated clipping work: submit once, reconcile repeatedly, import idempotently."""
 import asyncio
+import subprocess
 import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -84,6 +85,9 @@ async def import_clip(project: ClippingProject, item: dict) -> bool:
     if not provider_id.isdigit() or len(provider_id) > 64:
         raise VizardError("A generated clip had invalid metadata")
     async with TaskSessionLocal() as db:
+        current = await db.scalar(select(ClippingProject).where(ClippingProject.id == project.id).with_for_update())
+        if not current or current.run_token != project.run_token:
+            return False
         clip = await db.scalar(select(GeneratedClip).where(GeneratedClip.project_id == project.id, GeneratedClip.provider_clip_id == provider_id))
         if clip and (clip.deleted_at or clip.status == "ready"):
             return True
@@ -121,7 +125,7 @@ async def import_clip(project: ClippingProject, item: dict) -> bool:
             await storage.put_file(path, object_key, "video/mp4")
             await storage.put_file(thumbnail, thumbnail_key, "image/jpeg")
             async with TaskSessionLocal() as db:
-                current = await db.get(ClippingProject, project.id)
+                current = await db.scalar(select(ClippingProject).where(ClippingProject.id == project.id).with_for_update())
                 if not current or current.run_token != project.run_token:
                     return False
                 clip = await db.get(GeneratedClip, clip_id)
@@ -133,8 +137,11 @@ async def import_clip(project: ClippingProject, item: dict) -> bool:
                 await db.commit()
                 await publish_realtime_event(project.user_id, "clips.updated")
         return True
-    except (VizardError, StorageError, RuntimeError, ValueError, KeyError, OSError) as exc:
+    except (VizardError, StorageError, RuntimeError, ValueError, KeyError, IndexError, OSError, subprocess.SubprocessError) as exc:
         async with TaskSessionLocal() as db:
+            current = await db.scalar(select(ClippingProject).where(ClippingProject.id == project.id).with_for_update())
+            if not current or current.run_token != project.run_token:
+                return False
             clip = await db.get(GeneratedClip, clip_id)
             asset = await db.get(MediaAsset, asset_id)
             clip.status = "failed"
@@ -172,6 +179,8 @@ async def run_project(project_id: str) -> None:
 
     try:
         result = await VizardClient().status(project.provider_project_id)
+        if result.get("projectId") is not None and str(result["projectId"]) != project.provider_project_id:
+            raise VizardError("The returned project did not match this submission")
         if result.get("code") == 1000:
             if aware(project.created_at) < utcnow() - timedelta(hours=24):
                 await finish(project.id, token, status="failed", message="Processing is taking longer than expected. Check this project again later.")
@@ -195,7 +204,10 @@ async def run_project(project_id: str) -> None:
             if not isinstance(item, dict):
                 complete = False
                 continue
-            complete = await import_clip(project, item) and complete
+            try:
+                complete = await import_clip(project, item) and complete
+            except VizardError:
+                complete = False
         await finish(project.id, token, status="ready", message=None if complete else "Some clips could not be saved. Retry saving to recover them.")
     except VizardError as exc:
         await finish(project.id, token, status="processing" if exc.retryable else "failed", message=str(exc), delay=120 if exc.retryable else None)

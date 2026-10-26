@@ -21,7 +21,7 @@ from .deps import get_current_user, require_verified_user
 from .entitlements import require_capability
 from .events import publish_media_event
 from .media import append_chunk, parse_content_range
-from .models import MediaAsset, MediaUploadPart, Post, User
+from .models import GeneratedClip, MediaAsset, MediaUploadPart, Post, User
 from .schemas import MediaInitIn, MediaOut, MediaPartConfirmIn, MediaPartUrlOut, MessageOut
 from .security import create_media_token, decode_media_token
 from .storage import R2Storage, StorageError, StoredPart, normalize_etag
@@ -99,7 +99,10 @@ async def owned_media(db: AsyncSession, user: User, media_id: str, *, lock: bool
         raise HTTPException(
             status_code=404, detail={"code": "media_not_found", "message": "Upload not found"}
         )
-    if asset.purpose == "clipping":
+    generated = await db.scalar(select(GeneratedClip).where(GeneratedClip.media_id == asset.id).limit(1))
+    if generated and generated.deleted_at:
+        raise HTTPException(404, detail={"code": "media_not_found", "message": "Video not found"})
+    if asset.purpose == "clipping" or (generated and not generated.post_id):
         from .clipping import require_clipping
         await require_clipping(db, user)
     return asset

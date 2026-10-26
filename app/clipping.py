@@ -92,6 +92,7 @@ async def access(user: User = Depends(get_current_user), db: AsyncSession = Depe
 
 def project_out(project: ClippingProject) -> dict:
     return {"id": project.id, "name": project.name, "status": project.status, "options": project.options,
+            "can_retry": bool(project.provider_project_id and project.status in {"ready", "importing", "processing", "failed"}),
             "media": media_out(project.source), "error_message": project.error_message, "created_at": project.created_at,
             "clips": [{"id": clip.id, "title": clip.title, "status": clip.status, "media": media_out(clip.media) if clip.media else None,
                        "post_id": clip.post_id, "post_status": clip.post.status if clip.post else None,
