@@ -381,3 +381,29 @@ def test_invalid_output_does_not_block_other_clips(client, monkeypatch, probe_er
     assert result["status"] == "ready"
     assert sorted(clip["status"] for clip in result["clips"]) == ["failed", "ready"]
     assert result["can_retry"] is True
+
+
+def test_source_validation_failure_is_terminal(client, monkeypatch, tmp_path):
+    from app.tasks import _process_media
+    user_id, headers, _ = enable_creator(client, monkeypatch)
+    path = tmp_path / "broken.mp4"
+    path.write_bytes(b"not a valid video")
+    media_id = source(user_id, purpose="clipping", storage_backend="local", object_key=None,
+                      storage_path=str(path), status="processing")
+    def invalid(path):
+        raise subprocess.CalledProcessError(1, ["ffprobe"])
+    monkeypatch.setattr("app.tasks.probe_video", invalid)
+    asyncio.run(_process_media(media_id))
+    assert client.get(f"/v1/media/{media_id}", headers=headers).json()["status"] == "failed"
+
+
+def test_upload_queue_outage_preserves_an_explicitly_retryable_source(client, monkeypatch):
+    from kombu.exceptions import OperationalError as BrokerError
+    user_id, headers, _ = enable_creator(client, monkeypatch)
+    media_id = source(user_id, purpose="clipping", status="uploaded")
+    def unavailable(*args, **kwargs):
+        raise BrokerError("queue unavailable")
+    monkeypatch.setattr("app.tasks.process_media.apply_async", unavailable)
+    response = client.post(f"/v1/media/{media_id}/complete", headers=headers)
+    assert response.status_code == 503
+    assert client.get(f"/v1/media/{media_id}", headers=headers).json()["status"] == "uploaded"
