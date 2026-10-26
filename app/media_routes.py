@@ -10,6 +10,7 @@ import jwt
 from celery.exceptions import CeleryError
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
+from kombu.exceptions import OperationalError as BrokerError
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -584,9 +585,10 @@ async def complete_media(
             process_media.apply_async(args=[asset.id], queue="clipping")
         else:
             process_media.delay(asset.id)
-    except CeleryError as exc:
+    except (CeleryError, BrokerError, OSError) as exc:
         asset = await owned_media(db, user, media_id, lock=True)
-        asset.status = "uploaded"
+        if asset.status == "processing":
+            asset.status = "uploaded"
         await db.commit()
         raise HTTPException(
             status_code=503,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
+import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -125,7 +127,23 @@ async def _process_media(media_id: str) -> None:
         await db.commit()
 
         try:
-            if asset.storage_backend == "r2":
+            if asset.storage_backend == "r2" and asset.purpose == "clipping":
+                if not asset.object_key:
+                    raise ValueError("The uploaded video is no longer available")
+                storage = R2Storage(settings)
+                address = await storage.presign_download(asset.object_key)
+                # Inspect the private object with range requests instead of
+                # copying a multi-gigabyte source into Railway scratch space.
+                with tempfile.TemporaryDirectory(prefix="reverb-source-") as temporary:
+                    thumbnail = Path(temporary) / "thumbnail.jpg"
+                    duration, width, height = await asyncio.to_thread(probe_video, address)
+                    if not 1 <= duration <= maximum_duration or width <= 0 or height <= 0:
+                        raise ValueError("The video's duration or dimensions are not supported")
+                    await asyncio.to_thread(create_thumbnail, address, thumbnail)
+                    thumbnail_key = asset.thumbnail_key or storage.thumbnail_key(asset.user_id, asset.id)
+                    await storage.put_file(thumbnail, thumbnail_key, "image/jpeg")
+                checksum = None
+            elif asset.storage_backend == "r2":
                 if not asset.object_key:
                     raise ValueError("The uploaded video is no longer available")
                 storage = R2Storage(settings)
@@ -156,14 +174,15 @@ async def _process_media(media_id: str) -> None:
             # Preserve the processing state so Celery can safely retry the same
             # idempotent validation job.
             raise
-        except (RuntimeError, ValueError, KeyError, OSError) as exc:
+        except (RuntimeError, ValueError, KeyError, IndexError, OSError, subprocess.SubprocessError):
             current = await db.get(MediaAsset, media_id)
             if current:
                 current.status = "failed"
                 current.delete_after = datetime.now(UTC) + timedelta(days=7)
                 await db.commit()
                 await publish_media_event(current.user_id, current.id)
-            logger.info("Media validation failed for %s: %s", media_id, exc)
+            # FFmpeg exceptions can contain a private R2 signed URL.
+            logger.info("Media validation failed for %s", media_id)
             return
 
         current = await db.get(MediaAsset, media_id)

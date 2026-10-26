@@ -111,7 +111,7 @@ async def projects(user: User = Depends(require_verified_user), db: AsyncSession
     await require_clipping(db, user)
     records = list(await db.scalars(select(ClippingProject).where(ClippingProject.user_id == user.id).options(*PROJECT_OPTIONS).order_by(ClippingProject.created_at.desc()).limit(50)))
     uploads = list(await db.scalars(select(MediaAsset).where(MediaAsset.user_id == user.id, MediaAsset.purpose == "clipping",
-        MediaAsset.status.not_in(["failed", "expired"]), ~select(ClippingProject.id).where(ClippingProject.source_media_id == MediaAsset.id).exists()).order_by(MediaAsset.created_at.desc()).limit(10)))
+        MediaAsset.status != "expired", ~select(ClippingProject.id).where(ClippingProject.source_media_id == MediaAsset.id).exists()).order_by(MediaAsset.created_at.desc()).limit(10)))
     return {"items": [project_out(project) for project in records], "uploads": [media_out(asset) for asset in uploads]}
 
 

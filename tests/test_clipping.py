@@ -395,6 +395,7 @@ def test_source_validation_failure_is_terminal(client, monkeypatch, tmp_path):
     monkeypatch.setattr("app.tasks.probe_video", invalid)
     asyncio.run(_process_media(media_id))
     assert client.get(f"/v1/media/{media_id}", headers=headers).json()["status"] == "failed"
+    assert client.get("/v1/clips/projects", headers=headers).json()["uploads"][0]["status"] == "failed"
 
 
 def test_upload_queue_outage_preserves_an_explicitly_retryable_source(client, monkeypatch):

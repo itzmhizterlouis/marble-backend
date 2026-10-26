@@ -40,7 +40,16 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def probe_video(path: Path) -> tuple[int, int, int]:
+def video_input_options(path: Path | str) -> list[str]:
+    if str(path).startswith("https://"):
+        # Only Reverb-generated R2 URLs enter this path. Do not let uploaded
+        # manifests or external MOV tracks introduce additional fetches.
+        return ["-f", "mov", "-enable_drefs", "0", "-use_absolute_path", "0",
+                "-protocol_whitelist", "https,tls,tcp"]
+    return []
+
+
+def probe_video(path: Path | str) -> tuple[int, int, int]:
     executable = shutil.which("ffprobe")
     if not executable:
         raise RuntimeError("ffprobe is required to validate uploaded media")
@@ -55,6 +64,7 @@ def probe_video(path: Path) -> tuple[int, int, int]:
             "stream=width,height:format=duration",
             "-of",
             "json",
+            *video_input_options(path),
             str(path),
         ],
         check=True,
@@ -67,7 +77,7 @@ def probe_video(path: Path) -> tuple[int, int, int]:
     return round(float(payload["format"]["duration"])), int(stream["width"]), int(stream["height"])
 
 
-def create_thumbnail(path: Path, output: Path) -> None:
+def create_thumbnail(path: Path | str, output: Path) -> None:
     executable = shutil.which("ffmpeg")
     if not executable:
         raise RuntimeError("ffmpeg is required to create thumbnails")
@@ -78,6 +88,7 @@ def create_thumbnail(path: Path, output: Path) -> None:
             "-y",
             "-ss",
             "00:00:01",
+            *video_input_options(path),
             "-i",
             str(path),
             "-frames:v",
