@@ -407,3 +407,29 @@ def test_upload_queue_outage_preserves_an_explicitly_retryable_source(client, mo
     response = client.post(f"/v1/media/{media_id}/complete", headers=headers)
     assert response.status_code == 503
     assert client.get(f"/v1/media/{media_id}", headers=headers).json()["status"] == "uploaded"
+
+
+def test_r2_source_inspection_does_not_download_the_long_video(client, monkeypatch):
+    from app.tasks import _process_media
+    user_id, headers, _ = enable_creator(client, monkeypatch)
+    media_id = source(user_id, purpose="clipping", status="processing")
+    seen = []
+    async def signed(self, key, **kwargs):
+        return "https://test.r2.cloudflarestorage.com/source.mp4?test-signature=private"
+    async def forbidden_download(*args, **kwargs):
+        raise AssertionError("A long source must not be copied to Railway for inspection")
+    def probe(address):
+        seen.append(str(address))
+        return 1800, 1920, 1080
+    def thumbnail(address, output):
+        output.write_bytes(b"jpeg")
+    async def upload(self, path, key, content_type):
+        assert content_type == "image/jpeg"
+    monkeypatch.setattr("app.storage.R2Storage.presign_download", signed)
+    monkeypatch.setattr("app.storage.R2Storage.download_to_path", forbidden_download)
+    monkeypatch.setattr("app.tasks.probe_video", probe)
+    monkeypatch.setattr("app.tasks.create_thumbnail", thumbnail)
+    monkeypatch.setattr("app.storage.R2Storage.put_file", upload)
+    asyncio.run(_process_media(media_id))
+    assert seen and seen[0].startswith("https://test.r2.cloudflarestorage.com/")
+    assert client.get(f"/v1/media/{media_id}", headers=headers).json()["status"] == "ready"
